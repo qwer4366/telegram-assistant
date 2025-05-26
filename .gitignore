@@ -175,3 +175,4 @@ cython_debug/
 
 client_secret.json
 token.json
+.env

@@ -3,7 +3,11 @@ import logging
 import io
 import qrcode
 import asyncio
-import os.path
+import os
+from dotenv import load_dotenv # <-- لاستيراد متغيرات البيئة من .env
+
+# تحميل متغيرات البيئة من ملف .env
+load_dotenv()
 
 from openai import OpenAI
 # import google.generativeai as genai # معطل مؤقتًا
@@ -27,27 +31,38 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-
 # --- إعدادات البوت الأساسية ---
-BOT_TOKEN = "7719226402:AAHQ2RMk5e4SFDBhaVxk-hodY9PelRjRVFY"
+# يتم الآن تحميل التوكنات من متغيرات البيئة
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# GOOGLE_GEMINI_API_KEY = os.getenv("GOOGLE_GEMINI_API_KEY") # إذا أضفته لـ .env
+# DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY") # إذا أضفته لـ .env
 
-# --- إعدادات مفاتيح API ---
-OPENAI_API_KEY = "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"
 
-ADMIN_ID_1 = 1263152179
+ADMIN_ID_1 = 1263152179 # يمكنك أيضًا وضع هذه كمتغيرات بيئة إذا أردت
 ADMIN_ID_2 = 697852646
 ADMIN_IDS = [ADMIN_ID_1, ADMIN_ID_2]
 
 # --- إعدادات Google Drive API ---
 SCOPES = ['https://www.googleapis.com/auth/drive.metadata.readonly']
-CLIENT_SECRET_FILE = 'client_secret.json'
-TOKEN_FILE = 'token.json'
+CLIENT_SECRET_FILE = 'client_secret.json' # هذا الملف يجب أن يبقى محليًا ويُضاف لـ .gitignore
+TOKEN_FILE = 'token.json' # هذا الملف سيتم إنشاؤه ويجب إضافته لـ .gitignore
 
+# إعداد تسجيل الدخول
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# --- التحقق من وجود التوكنات الأساسية عند بدء التشغيل ---
+if not BOT_TOKEN:
+    logger.error("!!! BOT_TOKEN not found in environment variables or .env file. Bot cannot start.")
+    exit()
+if not OPENAI_API_KEY:
+    logger.warning("!!! OPENAI_API_KEY not found in environment variables or .env file. OpenAI features will not work.")
+# يمكنك إضافة تحققات مشابهة لبقية المفاتيح
+
 
 # --- دوال Google Drive ---
 async def get_gdrive_service_async():
@@ -83,7 +98,6 @@ async def get_gdrive_service_async():
                         logger.error(f"Critical: Credentials file '{CLIENT_SECRET_FILE}' not found at path: {os.path.join(os.getcwd(), CLIENT_SECRET_FILE)}. Cannot start auth flow.")
                         return None
                     flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES)
-                    # !!! تم التعديل هنا لاستخدام run_local_server !!!
                     creds = flow.run_local_server(port=0) 
                     logger.info("Google Drive authentication flow completed via local server.")
                 except FileNotFoundError:
@@ -170,14 +184,13 @@ async def qr_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         await update.message.reply_text("خطأ في إنشاء QR Code. تأكد من إدخال نص.")
 
+# --- دوال ميزة OpenAI ---
 async def get_openai_response(api_key: str, user_question: str) -> str:
-    if not api_key or len(api_key) < 50:
-        logger.error("OpenAI API key is not configured or seems too short.")
-        return "عذراً، لم يتم إعداد مفتاح OpenAI API بشكل صحيح."
+    # التحقق من المفتاح يتم الآن في testai_command قبل استدعاء هذه الدالة
     try:
         logger.info(f"Sending request to OpenAI API with question: {user_question}")
         def generate_sync():
-            client = OpenAI(api_key=api_key)
+            client = OpenAI(api_key=api_key) # استخدام المفتاح الممرر
             completion = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
@@ -207,10 +220,12 @@ async def testai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
     thinking_message = await update.message.reply_text("لحظات، جاري التواصل مع OpenAI... 🧠")
     logger.info(f"User {update.effective_user.id} asked OpenAI (via /testai): '{user_question}'")
-    if not OPENAI_API_KEY or len(OPENAI_API_KEY) < 50:
-        reply_text = "مفتاح OpenAI API غير مُعد بشكل صحيح. يرجى الاتصال بمسؤول البوت."
+    
+    # التحقق من أن OPENAI_API_KEY تم تحميله من .env
+    if not OPENAI_API_KEY:
+        reply_text = "مفتاح OpenAI API غير مُعد في متغيرات البيئة. يرجى الاتصال بمسؤول البوت."
         final_markup = None
-        logger.error("OpenAI API key is a placeholder or missing in testai_command.")
+        logger.error("OPENAI_API_KEY is not set (loaded from .env).")
     else:
         reply_text = await get_openai_response(OPENAI_API_KEY, user_question)
         keyboard = [
@@ -232,6 +247,8 @@ async def testai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply_text, reply_markup=final_markup)
     logger.info("Sent OpenAI's response to user with feedback buttons.")
 
+# --- (بقية دوال button_callback, list_gdrive_files_command, unknown_command كما هي في النسخة السابقة) ---
+# --- معالج ردود الأزرار المضمنة ---
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer(text="شكرًا لتقييمك!")
@@ -242,6 +259,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif query.data == 'feedback_not_useful':
         await query.edit_message_text(text=f"{query.message.text}\n\n---\nتقييمك: إجابة غير مفيدة 👎")
 
+# --- معالج أمر Google Drive ---
 async def list_gdrive_files_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
@@ -267,7 +285,7 @@ async def list_gdrive_files_command(update: Update, context: ContextTypes.DEFAUL
     if not os.path.exists(token_file_path_to_check):
         await context.bot.send_message(chat_id, 
             "للوصول إلى Google Drive، أحتاج إلى إذنك لأول مرة. "
-            "البوت سيحاول الآن فتح صفحة مصادقة في متصفحك الافتراضي. " # رسالة جديدة
+            "البوت سيحاول الآن فتح صفحة مصادقة في متصفحك الافتراضي. "
             "يرجى اتباع التعليمات في المتصفح للموافقة على الأذونات."
             "\nقد تحتاج للقيام بهذه الخطوة مرة واحدة فقط."
         )
@@ -323,6 +341,11 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- الدالة الرئيسية لتشغيل البوت ---
 if __name__ == '__main__':
     logger.info("Starting bot with GDrive, QR, and OpenAI features...")
+
+    # التحقق من أن BOT_TOKEN تم تحميله
+    if not BOT_TOKEN:
+        logger.critical("CRITICAL: BOT_TOKEN is not set. The bot cannot start. Please check your .env file or environment variables.")
+        exit() # إيقاف البوت إذا لم يتم العثور على توكن تيليجرام
 
     application = ApplicationBuilder().token(BOT_TOKEN).build()
 
