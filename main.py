@@ -44,7 +44,8 @@ ADMIN_ID_2 = 697852646
 ADMIN_IDS = [ADMIN_ID_1, ADMIN_ID_2]
 
 # --- إعدادات Google Drive API ---
-SCOPES = ['https://www.googleapis.com/auth/drive.metadata.readonly']
+# !!! تم تعديل النطاق هنا للسماح بقراءة محتوى الملفات !!!
+SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
 CLIENT_SECRET_FILE = 'client_secret.json' # هذا الملف يجب أن يبقى محليًا ويُضاف لـ .gitignore
 TOKEN_FILE = 'token.json' # هذا الملف سيتم إنشاؤه ويجب إضافته لـ .gitignore
 
@@ -57,8 +58,8 @@ logger = logging.getLogger(__name__)
 
 # --- التحقق من وجود التوكنات الأساسية عند بدء التشغيل ---
 if not BOT_TOKEN:
-    logger.error("!!! BOT_TOKEN not found in environment variables or .env file. Bot cannot start.")
-    exit()
+    logger.critical("CRITICAL: BOT_TOKEN is not set. The bot cannot start. Please check your .env file or environment variables.")
+    exit() # إيقاف البوت إذا لم يتم العثور على توكن تيليجرام
 if not OPENAI_API_KEY:
     logger.warning("!!! OPENAI_API_KEY not found in environment variables or .env file. OpenAI features will not work.")
 # يمكنك إضافة تحققات مشابهة لبقية المفاتيح
@@ -68,11 +69,11 @@ if not OPENAI_API_KEY:
 async def get_gdrive_service_async():
     def _authenticate_gdrive():
         creds = None
-        logger.info(f"DEBUG_AUTH: Current Working Directory in _authenticate_gdrive: {os.getcwd()}")
-        logger.info(f"DEBUG_AUTH: Checking for TOKEN_FILE at: {os.path.join(os.getcwd(), TOKEN_FILE)}")
-        logger.info(f"DEBUG_AUTH: TOKEN_FILE exists? {os.path.exists(os.path.join(os.getcwd(), TOKEN_FILE))}")
-        logger.info(f"DEBUG_AUTH: Checking for CLIENT_SECRET_FILE at: {os.path.join(os.getcwd(), CLIENT_SECRET_FILE)}")
-        logger.info(f"DEBUG_AUTH: CLIENT_SECRET_FILE exists? {os.path.exists(os.path.join(os.getcwd(), CLIENT_SECRET_FILE))}")
+        # logger.info(f"DEBUG_AUTH: Current Working Directory in _authenticate_gdrive: {os.getcwd()}")
+        # logger.info(f"DEBUG_AUTH: Checking for TOKEN_FILE at: {os.path.join(os.getcwd(), TOKEN_FILE)}")
+        # logger.info(f"DEBUG_AUTH: TOKEN_FILE exists? {os.path.exists(os.path.join(os.getcwd(), TOKEN_FILE))}")
+        # logger.info(f"DEBUG_AUTH: Checking for CLIENT_SECRET_FILE at: {os.path.join(os.getcwd(), CLIENT_SECRET_FILE)}")
+        # logger.info(f"DEBUG_AUTH: CLIENT_SECRET_FILE exists? {os.path.exists(os.path.join(os.getcwd(), CLIENT_SECRET_FILE))}")
 
         if os.path.exists(TOKEN_FILE):
             try:
@@ -144,7 +145,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/qr <نص> - لإنشاء QR Code\n"
         f"/testai <سؤال> - لطرح سؤال على OpenAI\n"
         f"/gdrivefiles - لعرض أول 5 ملفات من Google Drive\n"
-        "This bot is being enhanced by Jules!\n"
+        "This bot is being enhanced by Jules!\n" # السطر الذي أضافه Jules
         f"أو أرسل لي أي رسالة نصية وسأرددها."
     )
     await context.bot.send_message(chat_id=update.effective_chat.id, text=welcome_message)
@@ -164,6 +165,7 @@ async def admin_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         reply_text = "عذراً، هذا الأمر مخصص للمسؤولين فقط."
     await context.bot.send_message(chat_id=update.effective_chat.id, text=reply_text)
 
+# --- دوال ميزة QR Code ---
 async def generate_qr_image(text_to_encode: str) -> io.BytesIO | None:
     if not text_to_encode:
         return None
@@ -187,11 +189,10 @@ async def qr_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # --- دوال ميزة OpenAI ---
 async def get_openai_response(api_key: str, user_question: str) -> str:
-    # التحقق من المفتاح يتم الآن في testai_command قبل استدعاء هذه الدالة
     try:
         logger.info(f"Sending request to OpenAI API with question: {user_question}")
         def generate_sync():
-            client = OpenAI(api_key=api_key) # استخدام المفتاح الممرر
+            client = OpenAI(api_key=api_key)
             completion = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
@@ -222,7 +223,6 @@ async def testai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thinking_message = await update.message.reply_text("لحظات، جاري التواصل مع OpenAI... 🧠")
     logger.info(f"User {update.effective_user.id} asked OpenAI (via /testai): '{user_question}'")
     
-    # التحقق من أن OPENAI_API_KEY تم تحميله من .env
     if not OPENAI_API_KEY:
         reply_text = "مفتاح OpenAI API غير مُعد في متغيرات البيئة. يرجى الاتصال بمسؤول البوت."
         final_markup = None
@@ -248,7 +248,6 @@ async def testai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(reply_text, reply_markup=final_markup)
     logger.info("Sent OpenAI's response to user with feedback buttons.")
 
-# --- (بقية دوال button_callback, list_gdrive_files_command, unknown_command كما هي في النسخة السابقة) ---
 # --- معالج ردود الأزرار المضمنة ---
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -265,25 +264,25 @@ async def list_gdrive_files_command(update: Update, context: ContextTypes.DEFAUL
     chat_id = update.effective_chat.id
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
-    current_working_directory = os.getcwd()
-    client_secret_path_to_check = os.path.join(current_working_directory, CLIENT_SECRET_FILE)
-    token_file_path_to_check = os.path.join(current_working_directory, TOKEN_FILE)
-
-    logger.info(f"DEBUG: Current Working Directory: {current_working_directory}")
-    logger.info(f"DEBUG: Checking for CLIENT_SECRET_FILE ('{CLIENT_SECRET_FILE}') at: {client_secret_path_to_check}")
-    logger.info(f"DEBUG: CLIENT_SECRET_FILE exists? {os.path.exists(client_secret_path_to_check)}")
-    logger.info(f"DEBUG: Checking for TOKEN_FILE ('{TOKEN_FILE}') at: {token_file_path_to_check}")
-    logger.info(f"DEBUG: TOKEN_FILE exists? {os.path.exists(token_file_path_to_check)}")
+    # أسطر التشخيص يمكن تركها أو إزالتها الآن
+    # current_working_directory = os.getcwd()
+    # client_secret_path_to_check = os.path.join(current_working_directory, CLIENT_SECRET_FILE)
+    # token_file_path_to_check = os.path.join(current_working_directory, TOKEN_FILE)
+    # logger.info(f"DEBUG: Current Working Directory: {current_working_directory}")
+    # logger.info(f"DEBUG: Checking for CLIENT_SECRET_FILE ('{CLIENT_SECRET_FILE}') at: {client_secret_path_to_check}")
+    # logger.info(f"DEBUG: CLIENT_SECRET_FILE exists? {os.path.exists(client_secret_path_to_check)}")
+    # logger.info(f"DEBUG: Checking for TOKEN_FILE ('{TOKEN_FILE}') at: {token_file_path_to_check}")
+    # logger.info(f"DEBUG: TOKEN_FILE exists? {os.path.exists(token_file_path_to_check)}")
     
-    if not os.path.exists(client_secret_path_to_check):
+    if not os.path.exists(CLIENT_SECRET_FILE):
         await update.message.reply_text(
-            f"ملف `{CLIENT_SECRET_FILE}` غير موجود في المسار المتوقع: `{current_working_directory}`. "
+            f"ملف `{CLIENT_SECRET_FILE}` غير موجود في المسار المتوقع: `{os.getcwd()}`. "
             f"يرجى التأكد من وضعه في مجلد المشروع."
         )
-        logger.error(f"Missing {CLIENT_SECRET_FILE} at {client_secret_path_to_check}")
+        logger.error(f"Missing {CLIENT_SECRET_FILE} at {os.getcwd()}")
         return
 
-    if not os.path.exists(token_file_path_to_check):
+    if not os.path.exists(TOKEN_FILE):
         await context.bot.send_message(chat_id, 
             "للوصول إلى Google Drive، أحتاج إلى إذنك لأول مرة. "
             "البوت سيحاول الآن فتح صفحة مصادقة في متصفحك الافتراضي. "
@@ -343,10 +342,9 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 if __name__ == '__main__':
     logger.info("Starting bot with GDrive, QR, and OpenAI features...")
 
-    # التحقق من أن BOT_TOKEN تم تحميله
     if not BOT_TOKEN:
         logger.critical("CRITICAL: BOT_TOKEN is not set. The bot cannot start. Please check your .env file or environment variables.")
-        exit() # إيقاف البوت إذا لم يتم العثور على توكن تيليجرام
+        exit()
 
     application = ApplicationBuilder().token(BOT_TOKEN).build()
 
