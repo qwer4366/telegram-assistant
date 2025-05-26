@@ -62,7 +62,6 @@ async def generate_qr_image(text_to_encode: str) -> io.BytesIO | None:
     if not text_to_encode:
         return None
     
-    # تأكد أن qrcode و Pillow مثبتتان: pip install qrcode Pillow
     qr_img = qrcode.make(text_to_encode)
     img_byte_arr = io.BytesIO()
     qr_img.save(img_byte_arr, format='PNG')
@@ -73,7 +72,6 @@ async def qr_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """
     يعالج الأمر /qr لإنشاء وإرسال صورة QR Code.
     """
-    # استخلاص النص بعد الأمر /qr
     if not context.args:
         await update.message.reply_text(
             "لاستخدام الأمر، أرسل: /qr <النص أو الرابط الذي تريد تحويله إلى QR Code>"
@@ -84,11 +82,9 @@ async def qr_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     text_to_encode = " ".join(context.args)
     logger.info(f"User {update.effective_user.id} requested QR for text: '{text_to_encode}'")
 
-    # إنشاء صورة QR
     qr_image_stream = await generate_qr_image(text_to_encode)
 
     if qr_image_stream:
-        # إرسال الصورة
         await update.message.reply_photo(photo=qr_image_stream, caption=f"QR Code لـ: {text_to_encode}")
         logger.info(f"Sent QR code for '{text_to_encode}' to user {update.effective_user.id}.")
     else:
@@ -105,36 +101,26 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 if __name__ == '__main__':
     logger.info("Starting bot with QR Code feature...")
-    print("DEBUG: In __main__, about to build application...") # <--- سطر طباعة جديد
 
     # بناء التطبيق باستخدام التوكن
     application = ApplicationBuilder().token(BOT_TOKEN).build()
-    print("DEBUG: Application built.") # <--- سطر طباعة جديد
 
     # 1. إضافة معالج أمر /start
-    print("DEBUG: Registering start_command for /start...") # <--- سطر طباعة جديد
     application.add_handler(CommandHandler('start', start_command))
 
     # 2. إضافة معالج أمر /admin_test (تجريبي للمعرفات المضافة)
-    print("DEBUG: Registering admin_test_command for /admin_test...") # <--- سطر طباعة جديد
     application.add_handler(CommandHandler('admin_test', admin_test_command))
     
     # 3. إضافة معالج أمر /qr الجديد
-    print("DEBUG: Registering qr_command_handler for /qr...") # <--- سطر طباعة جديد
     application.add_handler(CommandHandler('qr', qr_command_handler))
 
     # 4. إضافة معالج الرسائل النصية (الترديد)
-    # يجب أن يكون هذا بعد معالجات الأوامر المحددة إذا أردت أن تستجيب الأوامر بشكل صحيح
-    print("DEBUG: Registering echo_message for text (non-command)...") # <--- سطر طباعة جديد
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), echo_message))
 
-    # 5. إضافة معالج للأوامر غير المعروفة (يجب أن يكون هذا منخفض الأولوية أو في النهاية)
-    print("DEBUG: Registering unknown_command for other commands...") # <--- سطر طباعة جديد
+    # 5. إضافة معالج للأوامر غير المعروفة
     application.add_handler(MessageHandler(filters.COMMAND, unknown_command))
     
     logger.info("Bot is now polling for updates...")
-    print("DEBUG: Starting polling...") # <--- سطر طباعة جديد
     application.run_polling()
 
     logger.info("Bot has stopped.")
-    print("DEBUG: Polling stopped.") # <--- سطر طباعة جديد
