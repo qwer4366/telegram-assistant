@@ -144,6 +144,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/qr <نص> - لإنشاء QR Code\n"
         f"/testai <سؤال> - لطرح سؤال على OpenAI\n"
         f"/gdrivefiles - لعرض أول 5 ملفات من Google Drive\n"
+        "This bot is being enhanced by Jules!\n"
         f"أو أرسل لي أي رسالة نصية وسأرددها."
     )
     await context.bot.send_message(chat_id=update.effective_chat.id, text=welcome_message)
