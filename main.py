@@ -56,6 +56,9 @@ ADMIN_IDS = [ADMIN_ID_1, ADMIN_ID_2]
 # --- إعدادات Google Drive API ---
 # Full access scope for Google Drive (read, write, create, delete).
 # If you previously authenticated with read-only, you might need to delete token.json and re-authenticate.
+
+# --- Conversation Handler States for /searchdata ---
+SELECT_FILE, SELECT_COLUMN, SELECT_MATCH_TYPE, INPUT_SEARCH_VALUE = range(4)
 SCOPES = ['https://www.googleapis.com/auth/drive']
 CLIENT_SECRET_FILE = 'client_secret.json'
 TOKEN_FILE = 'token.json'
@@ -343,21 +346,132 @@ def get_schema_from_file_sync(gdrive_service, file_id: str, mime_type: str) -> s
             return None # Should not be called for unsupported types based on askdata_command logic
 
         if column_names:
-            return f"أعمدة الملف هي: {', '.join(column_names)}"
+            return column_names # Return list of column names
         else:
             # This case might occur if CSV is empty after header or Excel sheet has no columns
             logger.warning(f"No column names extracted for file ID {file_id} (MIME: {mime_type}).")
-            return "لم يتم العثور على أعمدة في الملف."
+            return None # Return None if no columns found or error in specific parsing
 
     except HttpError as error:
         logger.error(f"HttpError during schema extraction (download) for file ID {file_id}: {error}")
-        return "حدث خطأ أثناء تنزيل الملف من Google Drive لاستخلاص الأعمدة."
+        return None # Indicate error by returning None
     except Exception as e:
         logger.error(f"General error in get_schema_from_file_sync for file ID {file_id}: {e}", exc_info=True)
-        return "حدث خطأ عام وغير متوقع أثناء محاولة استخلاص مخطط الملف."
+        return None # Indicate error by returning None
 
-async def get_schema_from_file_async(gdrive_service, file_id: str, mime_type: str) -> str | None:
+async def get_schema_from_file_async(gdrive_service, file_id: str, mime_type: str) -> list[str] | None: # Return type updated
     return await asyncio.to_thread(get_schema_from_file_sync, gdrive_service, file_id, mime_type)
+
+# --- Funciones para Búsqueda de Datos en Archivos ---
+def perform_actual_search_sync(gdrive_service, file_id: str, mime_type: str, column_name: str, match_type: str, search_value: str) -> pd.DataFrame | str:
+    try:
+        logger.info(f"Starting actual search: File ID {file_id}, Column '{column_name}', Match '{match_type}', Value '{search_value}'")
+        # Download file content
+        request = gdrive_service.files().get_media(fileId=file_id)
+        file_content_stream = io.BytesIO()
+        downloader = MediaIoBaseDownloader(file_content_stream, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+        file_bytes = file_content_stream.getvalue()
+        logger.info(f"File {file_id} downloaded for search.")
+
+        # Load DataFrame
+        df = None
+        if mime_type == 'text/csv':
+            try:
+                text_content = None
+                common_encodings = ['utf-8', 'iso-8859-1', 'windows-1252', 'windows-1256']
+                for encoding in common_encodings:
+                    try:
+                        text_content = file_bytes.decode(encoding)
+                        logger.info(f"Decoded CSV {file_id} with {encoding} for search.")
+                        break
+                    except UnicodeDecodeError:
+                        logger.debug(f"Failed to decode CSV {file_id} with {encoding} for search.")
+                if text_content is None:
+                    return "خطأ: تعذر فك ترميز ملف CSV."
+                df = pd.read_csv(io.StringIO(text_content))
+            except Exception as e_csv_load:
+                logger.error(f"Error loading CSV into DataFrame for search (File ID: {file_id}): {e_csv_load}")
+                return f"خطأ في تحميل ملف CSV: {e_csv_load}"
+        elif mime_type in ['application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet']:
+            try:
+                engine = 'openpyxl' if mime_type == 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' else None
+                df = pd.read_excel(io.BytesIO(file_bytes), engine=engine)
+            except Exception as e_excel_load:
+                logger.error(f"Error loading Excel into DataFrame for search (File ID: {file_id}): {e_excel_load}")
+                return f"خطأ في تحميل ملف Excel: {e_excel_load}"
+        else:
+            return f"نوع الملف {mime_type} غير مدعوم للبحث."
+
+        if df is None or df.empty:
+            return "الملف فارغ أو تعذر تحميل البيانات."
+        if column_name not in df.columns:
+            return f"العمود '{column_name}' غير موجود في الملف."
+
+        # Filter DataFrame
+        filtered_df = None
+        # For robust comparison, convert column to string for string operations,
+        # and attempt numeric conversion for numeric operations.
+        
+        col_as_str = df[column_name].astype(str)
+        search_value_lower = search_value.lower()
+
+        if match_type == 'contains':
+            filtered_df = df[col_as_str.str.lower().str.contains(search_value_lower, case=False, na=False)]
+        elif match_type == 'exact': # Changed from 'equals'
+            try: # Attempt numeric exact match
+                num_search_value = pd.to_numeric(search_value)
+                # Coerce errors in column to NaN, then compare. NaN will not equal num_search_value.
+                filtered_df = df[pd.to_numeric(df[column_name], errors='coerce') == num_search_value]
+            except ValueError: # Fallback to string exact match
+                filtered_df = df[col_as_str.str.lower() == search_value_lower]
+        elif match_type == 'not_contains':
+            filtered_df = df[~col_as_str.str.lower().str.contains(search_value_lower, case=False, na=False)]
+        elif match_type == 'not_exact': # Changed from 'not_equals'
+            try: # Attempt numeric non-equality
+                num_search_value = pd.to_numeric(search_value)
+                # For non-equality, NaNs in the column should also be included unless explicitly handled.
+                # Here, they won't match num_search_value, so they are effectively "not equal".
+                filtered_df = df[pd.to_numeric(df[column_name], errors='coerce') != num_search_value]
+            except ValueError: # Fallback to string non-equality
+                filtered_df = df[col_as_str.str.lower() != search_value_lower]
+        elif match_type == 'greater_than':
+            try:
+                num_search_value = pd.to_numeric(search_value)
+                filtered_df = df[pd.to_numeric(df[column_name], errors='coerce') > num_search_value]
+            except ValueError:
+                return "قيمة البحث لـ 'أكبر من' يجب أن تكون رقمية."
+        elif match_type == 'less_than':
+            try:
+                num_search_value = pd.to_numeric(search_value)
+                filtered_df = df[pd.to_numeric(df[column_name], errors='coerce') < num_search_value]
+            except ValueError:
+                return "قيمة البحث لـ 'أصغر من' يجب أن تكون رقمية."
+        elif match_type == 'starts_with':
+            filtered_df = df[col_as_str.str.startswith(search_value, case=False, na=False)]
+        elif match_type == 'ends_with':
+            filtered_df = df[col_as_str.str.endswith(search_value, case=False, na=False)]
+        else:
+            return f"نوع المطابقة '{match_type}' غير معروف."
+
+        if filtered_df is None: # Should ideally not happen if all paths lead to assignment or error return
+             logger.error(f"filtered_df remained None for match_type '{match_type}' - this indicates a logic flaw.")
+             return "خطأ في تطبيق الفلتر. لم يتم تحديد نتائج."
+        
+        logger.info(f"Search for '{search_value}' in column '{column_name}' with match type '{match_type}' yielded {len(filtered_df)} results.")
+        return filtered_df
+
+    except HttpError as error:
+        logger.error(f"HttpError during file download for search (File ID: {file_id}): {error}")
+        return "خطأ أثناء تنزيل الملف للبحث."
+    except Exception as e:
+        logger.error(f"General error in perform_actual_search_sync (File ID: {file_id}): {e}", exc_info=True)
+        return f"خطأ عام وغير متوقع أثناء البحث: {type(e).__name__}"
+
+async def perform_actual_search_async(gdrive_service, file_id: str, mime_type: str, column_name: str, match_type: str, search_value: str) -> pd.DataFrame | str:
+    return await asyncio.to_thread(perform_actual_search_sync, gdrive_service, file_id, mime_type, column_name, match_type, search_value)
 
 # --- (بقية الدوال مثل start_command, echo_message, admin_test_command, generate_qr_image, qr_command_handler, get_openai_response, testai_command كما هي) ---
 
@@ -1319,6 +1433,21 @@ if __name__ == '__main__':
     application.add_handler(MessageHandler(filters.Text(["📄 معالجة PDF"]), prompt_pdf_upload))
     application.add_handler(MessageHandler(filters.Text(["📤 رفع ملف إلى Drive"]), prompt_general_upload))
 
+    # --- Add Search Conversation Handler ---
+    search_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('searchdata', start_search_conversation)],
+        states={
+            SELECT_FILE: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_filename_for_search)],
+            SELECT_COLUMN: [CallbackQueryHandler(received_column_for_search, pattern=r'^search_col_select_\d+$')],
+            SELECT_MATCH_TYPE: [CallbackQueryHandler(received_match_type, pattern=r'^searchmatch_')], # Pattern example
+            INPUT_SEARCH_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_search_value)],
+        },
+        fallbacks=[CommandHandler('cancel_search', cancel_search_conversation)],
+        # persistent=False, # Using default (memory-based persistence for now)
+        # allow_reentry=True # Default is False, which is usually fine
+    )
+    application.add_handler(search_conv_handler)
+
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), echo_message))
     application.add_handler(MessageHandler(filters.COMMAND, unknown_command)) # Keep this last for unhandled commands
     
@@ -1326,3 +1455,253 @@ if __name__ == '__main__':
     application.run_polling()
 
     logger.info("Bot has stopped.")
+
+
+# --- Search Results Handling ---
+async def handle_search_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    search_params = context.user_data
+    
+    file_id = search_params.get('search_file_id')
+    mime_type = search_params.get('search_mime_type')
+    column_name = search_params.get('search_selected_column_name')
+    match_type = search_params.get('search_match_type')
+    search_value = search_params.get('search_value')
+    file_name = search_params.get('search_file_name', 'الملف المحدد')
+
+    if not all([file_id, mime_type, column_name, match_type, search_value is not None]): # search_value can be empty string
+        logger.error(f"User {user_id}: Missing search parameters in handle_search_results. Data: {search_params}")
+        await update.message.reply_text("حدث خطأ، بعض معلمات البحث مفقودة. يرجى المحاولة مرة أخرى.")
+        return
+
+    await update.message.reply_text(
+        f"جاري البحث في ملف '{escape_markdown_v2(file_name)}' عن قيمة '{escape_markdown_v2(search_value)}' في عمود '{escape_markdown_v2(column_name)}' بنوع المطابقة '{match_type}'...",
+        parse_mode='MarkdownV2'
+    )
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+
+    service = await get_gdrive_service_async()
+    if not service:
+        await update.message.reply_text("تعذر الاتصال بخدمة Google Drive لإجراء البحث.")
+        return
+
+    results_df_or_error_str = await perform_actual_search_async(
+        service, file_id, mime_type, column_name, match_type, search_value
+    )
+
+    if isinstance(results_df_or_error_str, pd.DataFrame):
+        logger.info(f"User {user_id}: Search successful. Found {len(results_df_or_error_str)} results in '{file_name}'.")
+        # For now, just confirm count. Detailed display in next step.
+        # We'll store the dataframe in user_data to be picked up by the next step/handler for display.
+        context.user_data['search_results_df'] = results_df_or_error_str 
+        
+        # This message will be replaced by the actual results display logic later
+        await update.message.reply_text(
+            f"تم العثور على {len(results_df_or_error_str)} نتيجة. (عرض النتائج التفصيلي قيد التطوير)."
+        )
+        # If we want to proceed to a new state for displaying results within the conversation:
+        # return DISPLAY_SEARCH_RESULTS 
+        # For now, the conversation ends after this.
+        if results_df_or_error_str.empty:
+            await update.message.reply_text("لم يتم العثور على نتائج تطابق معايير البحث المحددة.")
+        else:
+            num_total_results = len(results_df_or_error_str)
+            max_preview_rows = 10  # Max rows to show in preview
+            preview_df = results_df_or_error_str.head(max_preview_rows)
+            
+            try:
+                # Convert DataFrame preview to string
+                preview_text = preview_df.to_string(index=False, na_rep='-')
+            except Exception as e_to_str:
+                logger.error(f"Error converting DataFrame to string for preview: {e_to_str}")
+                preview_text = "خطأ في تنسيق معاينة النتائج."
+
+            max_chars = 4000 # Approx Telegram message limit
+            if len(preview_text) > max_chars:
+                preview_text = preview_text[:max_chars] + "\n... (تم اقتطاع المعاينة لطولها الزائد)"
+            
+            message = f"تم العثور على {num_total_results} نتيجة."
+            if num_total_results > 0: # Should always be true if not empty, but good check
+                message += f"\nإليك معاينة لأول {min(num_total_results, max_preview_rows)} نتيجة:\n\n```\n{preview_text}\n```" # escape_markdown_v2 not needed for text inside code block
+            
+            if num_total_results > max_preview_rows:
+                message += f"\n\n(يتم عرض أول {max_preview_rows} نتيجة فقط من إجمالي {num_total_results})."
+                # TODO: Implement "Download full results as CSV" button here
+                # results_id = str(uuid.uuid4()) # Requires import uuid
+                # context.bot_data[f"search_results_{results_id}"] = results_df_or_error_str # Store full df
+                # dl_button = InlineKeyboardButton("تنزيل النتائج كاملة (CSV)", callback_data=f"download_search_csv_{results_id}")
+                # reply_markup = InlineKeyboardMarkup([[dl_button]])
+                # await update.message.reply_text(message, parse_mode='MarkdownV2', reply_markup=reply_markup)
+                await update.message.reply_text(message, parse_mode='MarkdownV2') # Send without button for now
+            else:
+                await update.message.reply_text(message, parse_mode='MarkdownV2')
+            
+    else: # It's an error string
+        error_str = results_df_or_error_str # Rename for clarity
+        logger.error(f"User {user_id}: Search failed for file '{file_name}': {error_str}")
+        await update.message.reply_text(f"خطأ في البحث: {escape_markdown_v2(error_str)}")
+
+
+# --- /searchdata Conversation Functions ---
+async def start_search_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear() # Clear any previous user_data from this conversation
+    await update.message.reply_text(
+        "أهلاً بك في معالج البحث المتقدم!\n"
+        "الرجاء إدخال اسم ملف CSV أو Excel الذي تريد البحث فيه (أو جزء من اسمه)."
+    )
+    return SELECT_FILE
+
+async def received_filename_for_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    filename_query = update.message.text.strip()
+    if not filename_query:
+        await update.message.reply_text("لم يتم إدخال اسم ملف. الرجاء إدخال اسم ملف صالح أو استخدم /cancel_search لإلغاء البحث.")
+        return SELECT_FILE
+
+    await update.message.reply_text(f"جاري البحث عن ملف باسم: '{escape_markdown_v2(filename_query)}'...")
+    
+    service = await get_gdrive_service_async()
+    if not service:
+        await update.message.reply_text("تعذر الاتصال بخدمة Google Drive. لا يمكن متابعة البحث. حاول مرة أخرى لاحقًا أو استخدم /cancel_search.")
+        return ConversationHandler.END # Or SELECT_FILE to allow retry without full cancel
+
+    found_file_id, found_file_name, found_mime_type = await find_file_in_gdrive_async(service, filename_query)
+
+    compatible_mime_types = ['text/csv', 'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet']
+
+    if found_file_id and found_mime_type in compatible_mime_types:
+        context.user_data['search_file_id'] = found_file_id
+        context.user_data['search_file_name'] = found_file_name
+        context.user_data['search_mime_type'] = found_mime_type
+        
+        await update.message.reply_text(f"تم العثور على ملف: '{escape_markdown_v2(found_file_name)}' (نوع: {found_mime_type}).\nجاري استخلاص الأعمدة...")
+        
+        columns = await get_schema_from_file_async(service, found_file_id, found_mime_type)
+        
+        if columns: # Check if columns is not None and not empty
+            context.user_data['search_file_columns'] = columns
+            keyboard = [[InlineKeyboardButton(col, callback_data=f"search_col_select_{idx}")] for idx, col in enumerate(columns)]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text("الرجاء اختيار العمود الذي تريد البحث فيه:", reply_markup=reply_markup)
+            return SELECT_COLUMN
+        else:
+            await update.message.reply_text(
+                f"تم العثور على الملف '{escape_markdown_v2(found_file_name)}' ولكن لم أتمكن من قراءة الأعمدة. "
+                "الرجاء التأكد من أن الملف غير فارغ، وغير محمي بكلمة مرور، ويحتوي على صف ترويسة صحيح. "
+                "حاول مرة أخرى باسم ملف آخر أو استخدم /cancel_search."
+            )
+            return SELECT_FILE # Stay in the same state to allow user to try another filename
+    else:
+        if found_file_id: # File found but not compatible type
+             await update.message.reply_text(
+                f"تم العثور على ملف '{escape_markdown_v2(found_file_name)}' ولكن نوعه ({found_mime_type}) ليس CSV أو Excel. "
+                "لا يمكن البحث في هذا النوع من الملفات حاليًا. الرجاء إدخال اسم ملف CSV أو Excel صالح أو استخدم /cancel_search."
+            )
+        else: # File not found
+            await update.message.reply_text(
+                "لم يتم العثور على ملف CSV أو Excel بهذا الاسم. "
+                "الرجاء التأكد من الاسم والمحاولة مرة أخرى، أو استخدم /cancel_search."
+            )
+        return SELECT_FILE
+
+
+async def received_column_for_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # Placeholder - Full implementation in next subtask
+    query = update.callback_query
+    await query.answer()
+    selected_col_index = int(query.data.split('_')[-1])
+    selected_column_name = context.user_data['search_file_columns'][selected_col_index]
+    context.user_data['search_selected_column_name'] = selected_column_name
+    context.user_data['search_selected_column_index'] = selected_col_index
+    
+    logger.info(f"User selected column '{selected_column_name}' (index {selected_col_index}) for file '{context.user_data.get('search_file_name')}'.")
+    
+    await query.edit_message_text(text=f"تم اختيار عمود: '{escape_markdown_v2(selected_column_name)}'.\nالآن، كيف تريد البحث؟ (سيتم عرض خيارات المطابقة)")
+    # For now, ending the conversation here. Next step will define SELECT_MATCH_TYPE state.
+    # return ConversationHandler.END # Original placeholder end
+
+    match_types = {
+        'contains': "يحتوي على (نص)",
+        'exact': "يساوي تمامًا (نص/رقم)", # Changed 'equals' to 'exact' for clarity
+        'not_contains': "لا يحتوي على (نص)",
+        'not_exact': "لا يساوي تمامًا (نص/رقم)", # Changed 'not_equals'
+        'greater_than': "أكبر من (رقم)",
+        'less_than': "أصغر من (رقم)",
+        'starts_with': "يبدأ بـ (نص)",
+        'ends_with': "ينتهي بـ (نص)"
+    }
+    keyboard = []
+    # Create two buttons per row for a cleaner look
+    row_buttons = []
+    for key, text_label in match_types.items():
+        row_buttons.append(InlineKeyboardButton(text_label, callback_data=f"search_match_type_{key}"))
+        if len(row_buttons) == 2:
+            keyboard.append(row_buttons)
+            row_buttons = []
+    if row_buttons: # Add any remaining button
+        keyboard.append(row_buttons)
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        text=f"تم اختيار عمود: '{escape_markdown_v2(selected_column_name)}'.\nالرجاء اختيار نوع المطابقة للقيمة التي ستبحث عنها:",
+        reply_markup=reply_markup,
+        parse_mode='MarkdownV2'
+    )
+    return SELECT_MATCH_TYPE
+
+async def received_match_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # Placeholder - Full implementation in a future subtask
+    query = update.callback_query
+    await query.answer()
+    # Storing the selected match type
+    match_type_key = query.data.split('_')[-1]
+    context.user_data['search_match_type'] = match_type_key
+    
+    # For user-friendliness, get the display text of the match type
+    # This requires match_types to be accessible here or passed/redefined.
+    # For now, just use the key.
+    logger.info(f"User selected match type: {match_type_key}")
+    
+    await query.edit_message_text(text=f"تم اختيار نوع المطابقة: {match_type_key}.\nالرجاء إدخال القيمة التي تريد البحث عنها في عمود '{escape_markdown_v2(context.user_data.get('search_selected_column_name', 'المحدد'))}'.")
+    return INPUT_SEARCH_VALUE # Transition to inputting search value
+
+async def received_search_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    search_value = update.message.text.strip()
+    if not search_value:
+        await update.message.reply_text("لم يتم إدخال قيمة للبحث. الرجاء إدخال قيمة أو استخدم /cancel_search للإلغاء.")
+        return INPUT_SEARCH_VALUE # Stay in the same state to prompt again
+
+    context.user_data['search_value'] = search_value
+
+    logger.info(f"Search parameters collected for user {update.effective_user.id}:")
+    logger.info(f"  File ID: {context.user_data.get('search_file_id')}")
+    logger.info(f"  File Name: {context.user_data.get('search_file_name')}")
+    logger.info(f"  Selected Column Index: {context.user_data.get('search_selected_column_index')}")
+    logger.info(f"  Selected Column Name: {context.user_data.get('search_selected_column_name')}")
+    logger.info(f"  Match Type: {context.user_data.get('search_match_type')}")
+    logger.info(f"  Search Value: {search_value}")
+
+    # Placeholder for actual search logic
+    await update.message.reply_text(
+        f"تم استلام كل معطيات البحث.\n"
+        f"الملف: `{escape_markdown_v2(context.user_data.get('search_file_name', 'غير محدد'))}`\n"
+        f"العمود: `{escape_markdown_v2(context.user_data.get('search_selected_column_name', 'غير محدد'))}`\n"
+        f"نوع المطابقة: `{escape_markdown_v2(context.user_data.get('search_match_type', 'غير محدد'))}`\n"
+        f"القيمة للبحث: `{escape_markdown_v2(search_value)}`\n\n"
+        "(ملاحظة: سيتم الآن تنفيذ البحث الفعلي وعرض النتائج \\- هذه الميزة قيد التطوير حاليًا\\.)",
+        parse_mode='MarkdownV2'
+    )
+
+    # TODO: In the next plan step, call a function here like:
+    # await perform_actual_search(update, context) # This is now handle_search_results
+    # For now, we just end the conversation after calling handle_search_results.
+    
+    await handle_search_results(update, context) # Call the new handler
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def cancel_search_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("تم إلغاء عملية البحث. يمكنك البدء من جديد باستخدام /searchdata.")
+    context.user_data.clear()
+    return ConversationHandler.END
