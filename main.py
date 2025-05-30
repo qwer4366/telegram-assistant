@@ -11,6 +11,8 @@ import pandas as pd # <-- لاستيراد pandas
 load_dotenv()
 
 import json # For JSON processing
+import csv # For CSV schema extraction
+import re # For parsing --file in /askdata
 
 from openai import OpenAI
 # import google.generativeai as genai # معطل مؤقتًا
@@ -225,6 +227,138 @@ def upload_to_gdrive_sync(gdrive_service, file_bytes: bytes, file_name: str, mim
 async def upload_to_gdrive_async(gdrive_service, file_bytes: bytes, file_name: str, mime_type: str, folder_id: str) -> str | None:
     return await asyncio.to_thread(upload_to_gdrive_sync, gdrive_service, file_bytes, file_name, mime_type, folder_id)
 
+# --- OpenAI Helper Function (Modified) ---
+async def get_openai_response(api_key: str, messages: list) -> str:
+    try:
+        logger.info(f"Sending request to OpenAI API with messages: {messages}")
+        def generate_sync():
+            client = OpenAI(api_key=api_key)
+            completion = client.chat.completions.create(
+                model="gpt-4o-mini", # Or your preferred model
+                messages=messages,
+                max_tokens=1000 # Increased max_tokens for potentially more detailed data explanations
+            )
+            return completion.choices[0].message.content.strip()
+        assistant_reply = await asyncio.to_thread(generate_sync)
+        logger.info("Received response from OpenAI API.")
+        return assistant_reply if assistant_reply else "لم أتلق ردًا نصيًا من OpenAI."
+    except Exception as e:
+        logger.error(f"Error communicating with OpenAI API: {e}")
+        error_message = str(e).lower()
+        if "invalid api key" in error_message or "incorrect api key" in error_message:
+             return "عذراً، مفتاح OpenAI API غير صالح. يرجى التحقق منه."
+        if "quota" in error_message or "rate limit" in error_message:
+            return "عذراً، لقد تجاوزت حصة الاستخدام أو الحد الأقصى للطلبات لـ OpenAI API. يرجى المحاولة لاحقًا."
+        return f"عذراً، حدث خطأ أثناء محاولة الاتصال بـ OpenAI: ({type(e).__name__})"
+
+# --- Funciones para Búsqueda de Archivos y Schema en Google Drive ---
+def find_file_in_gdrive_sync(gdrive_service, filename_query: str) -> tuple[str | None, str | None, str | None]:
+    try:
+        # Escape single quotes in filename query for safety with Drive API
+        escaped_filename_query = filename_query.replace("'", "\\'")
+        drive_query = f"name = '{escaped_filename_query}' and trashed = false"
+        
+        logger.info(f"Searching for file in GDrive with query: {drive_query}")
+        results = gdrive_service.files().list(
+            q=drive_query,
+            pageSize=5, # Limit results, take the first one if multiple exact matches (rare for full names)
+            fields="files(id, name, mimeType)"
+        ).execute()
+        
+        items = results.get('files', [])
+        if items:
+            first_item = items[0]
+            logger.info(f"Found {len(items)} file(s) matching '{filename_query}'. Using first: ID {first_item.get('id')}, Name: {first_item.get('name')}, MIME: {first_item.get('mimeType')}")
+            return first_item.get('id'), first_item.get('name'), first_item.get('mimeType')
+        else:
+            logger.info(f"No file found matching '{filename_query}' in GDrive.")
+            return None, None, None
+    except HttpError as error:
+        logger.error(f"HttpError during GDrive file search for '{filename_query}': {error}")
+        return None, None, None
+    except Exception as e:
+        logger.error(f"General error during GDrive file search for '{filename_query}': {e}", exc_info=True)
+        return None, None, None
+
+async def find_file_in_gdrive_async(gdrive_service, filename_query: str) -> tuple[str | None, str | None, str | None]:
+    return await asyncio.to_thread(find_file_in_gdrive_sync, gdrive_service, filename_query)
+
+def get_schema_from_file_sync(gdrive_service, file_id: str, mime_type: str) -> str | None:
+    try:
+        logger.info(f"Attempting to download file ID {file_id} for schema extraction (MIME: {mime_type}).")
+        request = gdrive_service.files().get_media(fileId=file_id)
+        file_content_stream = io.BytesIO()
+        downloader = MediaIoBaseDownloader(file_content_stream, request)
+        done = False
+        while not done:
+            status, done = downloader.next_chunk()
+            # logger.debug(f"Schema download progress: {int(status.progress() * 100)}%.") # Can be verbose
+        
+        file_bytes = file_content_stream.getvalue()
+        logger.info(f"File ID {file_id} downloaded successfully for schema extraction.")
+
+        column_names = []
+        if mime_type == 'text/csv':
+            try:
+                # Try decoding with utf-8 first, then with common alternatives if it fails
+                text_content = None
+                common_encodings = ['utf-8', 'iso-8859-1', 'windows-1252', 'windows-1256'] # Added windows-1256 for Arabic
+                for encoding in common_encodings:
+                    try:
+                        text_content = file_bytes.decode(encoding)
+                        logger.info(f"Decoded CSV {file_id} with {encoding}.")
+                        break
+                    except UnicodeDecodeError:
+                        logger.debug(f"Failed to decode CSV {file_id} with {encoding}.")
+                
+                if text_content is None:
+                    logger.error(f"Could not decode CSV {file_id} with any common encoding.")
+                    return "تعذر فك ترميز ملف CSV باستخدام الترميزات الشائعة."
+
+                csv_file = io.StringIO(text_content)
+                reader = csv.reader(csv_file)
+                column_names = next(reader) # Get header row
+            except StopIteration: # Empty file
+                logger.warning(f"CSV file {file_id} is empty or has no header.")
+                return "ملف CSV فارغ أو لا يحتوي على رؤوس أعمدة."
+            except csv.Error as e_csv:
+                logger.error(f"CSV processing error for {file_id}: {e_csv}")
+                return f"خطأ في معالجة ملف CSV: {e_csv}"
+            except UnicodeDecodeError as e_unicode: # Fallback, though loop above should handle
+                logger.error(f"Final UnicodeDecodeError for CSV {file_id}: {e_unicode}")
+                return "خطأ في فك ترميز ملف CSV. تأكد من أن الملف بترميز صحيح (مثل UTF-8)."
+
+        elif mime_type in ['application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet']:
+            try:
+                # Reading only the header row by using nrows=0 and then getting columns
+                # Forcing openpyxl for xlsx if available, as xlrd might be deprecated/removed for xlsx
+                engine = 'openpyxl' if mime_type == 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' else None
+                df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=0, nrows=0, engine=engine)
+                column_names = df.columns.tolist()
+            except Exception as e_excel: # Catching a broader range of pandas/excel reader errors
+                logger.error(f"Excel processing error for {file_id}: {e_excel}")
+                return f"خطأ في معالجة ملف Excel: {e_excel}. تأكد أن الملف غير تالف."
+        else:
+            logger.warning(f"Unsupported mime_type '{mime_type}' for schema extraction from file ID {file_id}.")
+            return None # Should not be called for unsupported types based on askdata_command logic
+
+        if column_names:
+            return f"أعمدة الملف هي: {', '.join(column_names)}"
+        else:
+            # This case might occur if CSV is empty after header or Excel sheet has no columns
+            logger.warning(f"No column names extracted for file ID {file_id} (MIME: {mime_type}).")
+            return "لم يتم العثور على أعمدة في الملف."
+
+    except HttpError as error:
+        logger.error(f"HttpError during schema extraction (download) for file ID {file_id}: {error}")
+        return "حدث خطأ أثناء تنزيل الملف من Google Drive لاستخلاص الأعمدة."
+    except Exception as e:
+        logger.error(f"General error in get_schema_from_file_sync for file ID {file_id}: {e}", exc_info=True)
+        return "حدث خطأ عام وغير متوقع أثناء محاولة استخلاص مخطط الملف."
+
+async def get_schema_from_file_async(gdrive_service, file_id: str, mime_type: str) -> str | None:
+    return await asyncio.to_thread(get_schema_from_file_sync, gdrive_service, file_id, mime_type)
+
 # --- (بقية الدوال مثل start_command, echo_message, admin_test_command, generate_qr_image, qr_command_handler, get_openai_response, testai_command كما هي) ---
 
 # --- PDF Document Handler ---
@@ -413,31 +547,32 @@ async def qr_command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         await update.message.reply_text("خطأ في إنشاء QR Code. تأكد من إدخال نص.")
 
-async def get_openai_response(api_key: str, user_question: str) -> str:
-    try:
-        logger.info(f"Sending request to OpenAI API with question: {user_question}")
-        def generate_sync():
-            client = OpenAI(api_key=api_key)
-            completion = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant. Please respond in Arabic unless the user asks for another language."},
-                    {"role": "user", "content": user_question}
-                ],
-                max_tokens=300
-            )
-            return completion.choices[0].message.content.strip()
-        assistant_reply = await asyncio.to_thread(generate_sync)
-        logger.info("Received response from OpenAI API.")
-        return assistant_reply if assistant_reply else "لم أتلق ردًا نصيًا من OpenAI."
-    except Exception as e:
-        logger.error(f"Error communicating with OpenAI API: {e}")
-        error_message = str(e).lower()
-        if "invalid api key" in error_message or "incorrect api key" in error_message:
-             return "عذراً، مفتاح OpenAI API غير صالح. يرجى التحقق منه."
-        if "quota" in error_message or "rate limit" in error_message:
-            return "عذراً، لقد تجاوزت حصة الاستخدام أو الحد الأقصى للطلبات لـ OpenAI API. يرجى المحاولة لاحقًا."
-        return f"عذراً، حدث خطأ أثناء محاولة الاتصال بـ OpenAI: ({type(e).__name__})"
+# This is the old get_openai_response, which will be replaced by the one defined above.
+# async def get_openai_response(api_key: str, user_question: str) -> str:
+#     try:
+#         logger.info(f"Sending request to OpenAI API with question: {user_question}")
+#         def generate_sync():
+#             client = OpenAI(api_key=api_key)
+#             completion = client.chat.completions.create(
+#                 model="gpt-4o-mini",
+#                 messages=[
+#                     {"role": "system", "content": "You are a helpful assistant. Please respond in Arabic unless the user asks for another language."},
+#                     {"role": "user", "content": user_question}
+#                 ],
+#                 max_tokens=300
+#             )
+#             return completion.choices[0].message.content.strip()
+#         assistant_reply = await asyncio.to_thread(generate_sync)
+#         logger.info("Received response from OpenAI API.")
+#         return assistant_reply if assistant_reply else "لم أتلق ردًا نصيًا من OpenAI."
+#     except Exception as e:
+#         logger.error(f"Error communicating with OpenAI API: {e}")
+#         error_message = str(e).lower()
+#         if "invalid api key" in error_message or "incorrect api key" in error_message:
+#              return "عذراً، مفتاح OpenAI API غير صالح. يرجى التحقق منه."
+#         if "quota" in error_message or "rate limit" in error_message:
+#             return "عذراً، لقد تجاوزت حصة الاستخدام أو الحد الأقصى للطلبات لـ OpenAI API. يرجى المحاولة لاحقًا."
+#         return f"عذراً، حدث خطأ أثناء محاولة الاتصال بـ OpenAI: ({type(e).__name__})"
 
 async def testai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -452,7 +587,12 @@ async def testai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         final_markup = None
         logger.error("OPENAI_API_KEY is not set.")
     else:
-        reply_text = await get_openai_response(OPENAI_API_KEY, user_question)
+        # Construct messages list for the new get_openai_response
+        messages_for_testai = [
+            {"role": "system", "content": "أنت مساعد مفيد. الرجاء الرد باللغة العربية ما لم يطلب المستخدم لغة أخرى."},
+            {"role": "user", "content": user_question}
+        ]
+        reply_text = await get_openai_response(OPENAI_API_KEY, messages_for_testai)
         keyboard = [[ InlineKeyboardButton("👍", callback_data='feedback_useful'), InlineKeyboardButton("👎", callback_data='feedback_not_useful'),]]
         final_markup = InlineKeyboardMarkup(keyboard)
     try:
@@ -465,36 +605,101 @@ async def testai_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- /askdata Command Handler ---
 async def askdata_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("الرجاء إدخال سؤالك بعد الأمر. مثال: `/askdata ما هو متوسط المبيعات لمنتج س؟`")
+        if update.message and update.message.text and update.message.text.startswith("❓ اسأل عن بياناتي"):
+            await update.message.reply_text("ما هو سؤالك عن البيانات؟ يمكنك استخدام الصيغة: `/askdata سؤالك هنا --file اسم_الملف.csv` لتحديد ملف معين.")
+            return
+        await update.message.reply_text("الرجاء إدخال سؤالك بعد الأمر. مثال: `/askdata ما هو متوسط المبيعات --file data.csv`")
         return
 
-    user_question = " ".join(context.args)
-    logger.info(f"User {update.effective_user.id} asked via /askdata: '{user_question}'")
+    full_text_args = " ".join(context.args)
+    
+    # Parse question and filename
+    user_question_text = full_text_args
+    target_file_name_query = None
+    match = re.search(r"(.+?)\s*--file\s+(.+)", full_text_args, re.IGNORECASE)
+    if match:
+        user_question_text = match.group(1).strip()
+        target_file_name_query = match.group(2).strip()
 
-    thinking_message = await update.message.reply_text("لحظات، أفكر في سؤالك عن البيانات... 🧠")
+    if not user_question_text: # Only --file was provided, or empty question
+        await update.message.reply_text("الرجاء إدخال سؤالك قبل `--file`. مثال: `/askdata ما هو متوسط المبيعات --file data.csv`")
+        return
+
+    logger.info(f"User {update.effective_user.id} asked via /askdata: Question='{user_question_text}', File Query='{target_file_name_query}'")
+    thinking_message = await update.message.reply_text(f"لحظات، أفكر في سؤالك: \"{escape_markdown_v2(user_question_text)}\"...")
 
     if not OPENAI_API_KEY:
-        await context.bot.edit_message_text(
-            chat_id=thinking_message.chat_id,
-            message_id=thinking_message.message_id,
-            text="مفتاح OpenAI API غير مُعد. لا يمكن معالجة طلب /askdata."
-        )
-        logger.error("OPENAI_API_KEY is not set. Cannot process /askdata.")
+        await context.bot.edit_message_text(chat_id=thinking_message.chat_id, message_id=thinking_message.message_id, text="مفتاح OpenAI API غير مُعد.")
+        logger.error("OPENAI_API_KEY is not set.")
         return
 
-    # Prepare a more detailed prompt for data-related questions
-    prompt_for_openai = (
-        "أنت مساعد ذكاء اصطناعي متخصص في تحليل البيانات والإجابة على الأسئلة المتعلقة بها. "
-        "المستخدم سيسألك عن بيانات قد تكون في ملفات CSV, Excel, أو قواعد بيانات. "
+    target_file_id_for_openai = None
+    target_mime_type_for_openai = None
+    schema_description_for_openai = None
+    file_context_message = "" # Additional context for OpenAI based on file
+
+    if target_file_name_query:
+        await context.bot.edit_message_text(chat_id=thinking_message.chat_id, message_id=thinking_message.message_id, text=f"جاري البحث عن ملفك '{escape_markdown_v2(target_file_name_query)}' في Google Drive...")
+        service = await get_gdrive_service_async()
+        if not service:
+            await context.bot.edit_message_text(chat_id=thinking_message.chat_id, message_id=thinking_message.message_id, text="تعذر الاتصال بخدمة Google Drive للبحث عن الملف.")
+            # Fallback to answering without file context
+        else:
+            found_file_id, found_file_name, found_mime_type = await find_file_in_gdrive_async(service, target_file_name_query)
+
+            if found_file_id:
+                await context.bot.edit_message_text(chat_id=thinking_message.chat_id, message_id=thinking_message.message_id, text=f"تم العثور على ملف '{escape_markdown_v2(found_file_name)}'. جاري استخلاص مخطط البيانات...")
+                
+                # Check MIME type for compatibility (CSV/Excel)
+                compatible_mime_types = ['text/csv', 'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet']
+                if found_mime_type in compatible_mime_types:
+                    target_file_id_for_openai = found_file_id
+                    target_mime_type_for_openai = found_mime_type
+                    
+                    schema_description_for_openai = await get_schema_from_file_async(service, target_file_id_for_openai, target_mime_type_for_openai)
+                    
+                    if schema_description_for_openai:
+                        file_context_message = f"\n\nتم العثور على ملف باسم '{escape_markdown_v2(found_file_name)}' من نوع '{target_mime_type_for_openai}'. {schema_description_for_openai}."
+                        await context.bot.edit_message_text(chat_id=thinking_message.chat_id, message_id=thinking_message.message_id, text=f"تم استخلاص مخطط البيانات لملف '{escape_markdown_v2(found_file_name)}'. الآن أفكر في إجابة سؤالك...")
+                    else:
+                        file_context_message = f"\n\nتم العثور على ملف باسم '{escape_markdown_v2(found_file_name)}' ولكن لم أتمكن من استخلاص مخطط الأعمدة. سأحاول الإجابة على سؤالك بدونه."
+                        await context.bot.edit_message_text(chat_id=thinking_message.chat_id, message_id=thinking_message.message_id, text=file_context_message)
+                else:
+                    file_context_message = f"\n\nالملف '{escape_markdown_v2(found_file_name)}' (نوع: {found_mime_type}) ليس من نوع CSV أو Excel. سأجيب على سؤالك بدون تحليل محتواه."
+                    await context.bot.edit_message_text(chat_id=thinking_message.chat_id, message_id=thinking_message.message_id, text=file_context_message)
+            else:
+                file_context_message = f"\n\nلم أتمكن من العثور على ملف بالاسم '{escape_markdown_v2(target_file_name_query)}' في Google Drive. سأحاول الإجابة على سؤالك بدون سياق الملف."
+                await context.bot.edit_message_text(chat_id=thinking_message.chat_id, message_id=thinking_message.message_id, text=file_context_message)
+    
+    # Construct the messages list for OpenAI
+    system_message_content = "أنت مساعد ذكاء اصطناعي متخصص في تحليل البيانات والإجابة على الأسئلة المتعلقة بها. "
+    if schema_description_for_openai: # This now implies a file was found and schema extracted
+        system_message_content += (
+            f"المستخدم يسأل عن بيانات في ملف. {schema_description_for_openai}. "
+            "الرجاء استخدام هذه الأعمدة كمرجع أساسي لفهم البيانات وتقديم إجابة دقيقة أو اقتراح كود Pandas مناسب إذا كان ذلك ملائمًا للسؤال. "
+            "إذا كان السؤال يتطلب البحث في البيانات نفسها (مثلاً، 'ما هو متوسط السعر؟')، وضح أنك لا تستطيع الوصول المباشر لمحتوى الملف ولكن يمكنك المساعدة في كيفية إجراء الحساب بناءً على الأعمدة المعطاة."
+        )
+    elif target_file_name_query: # File was specified but not found, or schema not extracted
+         system_message_content += (
+             f"حاول المستخدم تحديد ملف باسم '{escape_markdown_v2(target_file_name_query)}' ولكن لم يتم العثور عليه أو لم يتم استخلاص مخططه. "
+             "أجب على السؤال بشكل عام قدر الإمكان، أو اطلب من المستخدم التأكد من اسم الملف أو تحميله مباشرة."
+         )
+    else: # No file specified
+        system_message_content += "المستخدم يسأل سؤالاً عاماً عن البيانات. "
+    
+    system_message_content += (
         "حاول الإجابة على سؤاله بشكل مباشر ومفيد. "
-        "إذا كان السؤال يتطلب عملية حسابية معقدة أو البحث في ملف بيانات ولم يكن لديك وصول مباشر للملف، "
-        "يمكنك توضيح الخطوات أو نوع الاستعلام الذي قد يحتاجه المستخدم "
-        "(مثلاً، كود Pandas تقريبي أو استعلام SQL). "
-        "لا تخترع بيانات إذا لم تكن متوفرة.\n\n"
-        f"سؤال المستخدم: {user_question}"
+        "إذا كان السؤال يتطلب عملية حسابية معقدة أو البحث في ملف بيانات ولم يكن لديك وصول مباشر للملف (أو لم يتم تحديد ملف صالح)، "
+        "يمكنك توضيح الخطوات أو نوع الاستعلام الذي قد يحتاجه المستخدم. لا تخترع بيانات إذا لم تكن متوفرة."
     )
 
-    response = await get_openai_response(OPENAI_API_KEY, prompt_for_openai)
+    messages_for_askdata = [
+        {"role": "system", "content": system_message_content},
+        {"role": "user", "content": user_question_text}
+    ]
+
+    logger.info(f"Sending to OpenAI for /askdata with messages: {messages_for_askdata}")
+    response = await get_openai_response(OPENAI_API_KEY, messages_for_askdata)
 
     try:
         await context.bot.edit_message_text(
@@ -510,61 +715,141 @@ async def askdata_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --- معالج أمر Google Drive ---
-async def list_gdrive_files_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def list_gdrive_files_command(update: Update, context: ContextTypes.DEFAULT_TYPE, page_token: str = None, folder_id: str = 'root'):
     chat_id = update.effective_chat.id
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-    
+    user_id = update.effective_user.id
+    is_callback = hasattr(update, 'callback_query') and update.callback_query is not None
+    message_to_edit_id = None
+
+    if is_callback:
+        message_to_edit_id = update.callback_query.message.message_id
+        # Ensure query is answered for callbacks
+        try:
+            await update.callback_query.answer()
+        except Exception as e_ans: # Can fail if already answered or too old
+            logger.debug(f"Callback query answer failed (likely already answered): {e_ans}")
+    else: # Initial command call
+        await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
     if not os.path.exists(CLIENT_SECRET_FILE):
-        await update.message.reply_text(f"ملف `{CLIENT_SECRET_FILE}` غير موجود في: `{os.getcwd()}`.")
+        error_msg = f"ملف `{CLIENT_SECRET_FILE}` غير موجود."
+        if is_callback and message_to_edit_id: await context.bot.edit_message_text(chat_id=chat_id, message_id=message_to_edit_id, text=error_msg, parse_mode='MarkdownV2')
+        else: await context.bot.send_message(chat_id=chat_id, text=error_msg, parse_mode='MarkdownV2')
         logger.error(f"Missing {CLIENT_SECRET_FILE} at {os.getcwd()}")
         return
 
-    if not os.path.exists(TOKEN_FILE):
+    if not os.path.exists(TOKEN_FILE) and not is_callback : # Only prompt for auth on direct command, not on page navigation
         await context.bot.send_message(chat_id, "للوصول لـ Google Drive، أحتاج إذنك (مرة واحدة). اتبع التعليمات في الطرفية.")
+        # Actual auth flow happens in get_gdrive_service_async if token is missing/invalid
 
     service = await get_gdrive_service_async()
     if not service:
-        await update.message.reply_text("لم أتمكن من الاتصال بـ Google Drive.")
+        error_msg = "لم أتمكن من الاتصال بـ Google Drive."
+        if is_callback and message_to_edit_id: await context.bot.edit_message_text(chat_id=chat_id, message_id=message_to_edit_id, text=error_msg)
+        else: await context.bot.send_message(chat_id=chat_id, text=error_msg)
         return
 
     try:
-        logger.info(f"User {update.effective_user.id} requested GDrive files.")
+        logger.info(f"User {user_id} requested GDrive files. Folder: '{folder_id}', PageToken: '{page_token}'")
+        
+        drive_query = f"'{folder_id}' in parents and trashed=false"
+        page_size = 10 # Number of files per page
+
         def list_files_sync():
-            return service.files().list(pageSize=10, fields="files(id, name, mimeType,webViewLink)", orderBy="modifiedTime desc").execute()
+            return service.files().list(
+                q=drive_query,
+                pageSize=page_size,
+                fields="nextPageToken, files(id, name, mimeType, webViewLink)",
+                orderBy="folder, name", # Folders first, then by name
+                pageToken=page_token
+            ).execute()
+
         results = await asyncio.to_thread(list_files_sync)
         items = results.get('files', [])
-        if not items:
-            await update.message.reply_text('لا توجد ملفات في Google Drive.')
-            return
-        await update.message.reply_text("أحدث الملفات/المجلدات (ملفات CSV لها زر للقراءة):")
-        for item in items:
-            icon = "📁" if item['mimeType'] == 'application/vnd.google-apps.folder' else "📄"
-            link = item.get('webViewLink', '')
-            name_escaped = item['name'].replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace(']', '\\]').replace('(', '\\(').replace(')', '\\)').replace('~', '\\~').replace('`', '\\`').replace('>', '\\>').replace('#', '\\#').replace('+', '\\+').replace('-', '\\-').replace('=', '\\=').replace('|', '\\|').replace('{', '\\{').replace('}', '\\}').replace('.', '\\.').replace('!', '\\!')
-            file_info_line = f"{icon} [{name_escaped}]({link})" if link else f"{icon} {name_escaped}"
-            
-            buttons = []
-            if item['mimeType'] != 'application/vnd.google-apps.folder':
-                buttons.append(InlineKeyboardButton(f"📥 تحميل", callback_data=f'download_gdrive_{item["id"]}'))
-            
-            if item['mimeType'] == 'text/csv': # CSV specific button
-                buttons.append(InlineKeyboardButton(f"📄 اقرأ هذا الـ CSV", callback_data=f'read_csv_{item["id"]}'))
-            
-            if item['mimeType'] == 'application/json' or item['name'].lower().endswith('.json'):
-                buttons.append(InlineKeyboardButton("📊 تحليل JSON", callback_data=f'analyze_json_gdrive_{item["id"]}'))
-            
-            if item['mimeType'] == 'text/plain' or item['name'].lower().endswith('.txt'):
-                buttons.append(InlineKeyboardButton("📖 عرض TXT", callback_data=f'options_txt_gdrive_{item["id"]}'))
+        next_page_token_from_api = results.get('nextPageToken')
+        
+        message_text_parts = []
+        keyboard_buttons_rows = [] # Each element is a row of buttons
 
-            reply_markup = None
-            if buttons:
-                # InlineKeyboardMarkup expects a list of lists of buttons (rows of buttons)
-                reply_markup = InlineKeyboardMarkup([buttons]) 
+        if not items and not page_token: # Only show "empty" if it's the first page and no items
+            message_text_parts.append("المجلد فارغ أو لا يحتوي على ملفات يمكن الوصول إليها.")
+        else:
+            if not is_callback: # For initial call, send a header message
+                 message_text_parts.append("أحدث الملفات والمجلدات:") # This might be replaced if editing
+
+            for item in items:
+                icon = "📁" if item['mimeType'] == 'application/vnd.google-apps.folder' else "📄"
+                link = item.get('webViewLink', '') # Not used directly in message to save space, but good for logs
+                file_name_escaped = escape_markdown_v2(item['name'])
                 
-            await update.message.reply_text(file_info_line, parse_mode='MarkdownV2', reply_markup=reply_markup)
+                # Each file/folder will have its own message or be part of a list in one message.
+                # For simplicity with inline buttons, sending one message per item is easier if buttons are complex.
+                # However, to use pagination buttons effectively, all items for a page should be in ONE message.
+                
+                file_info_line = f"{icon} {file_name_escaped}"
+                message_text_parts.append(file_info_line)
+
+                action_buttons = []
+                if item['mimeType'] != 'application/vnd.google-apps.folder':
+                    action_buttons.append(InlineKeyboardButton("📥 تحميل", callback_data=f'download_gdrive_{item["id"]}'))
+                
+                if item['mimeType'] == 'text/csv':
+                    action_buttons.append(InlineKeyboardButton("📄 اقرأ CSV", callback_data=f'read_csv_{item["id"]}'))
+                
+                if item['mimeType'] == 'application/json' or item['name'].lower().endswith('.json'):
+                    action_buttons.append(InlineKeyboardButton("📊 تحليل JSON", callback_data=f'analyze_json_gdrive_{item["id"]}'))
+                
+                if item['mimeType'] == 'text/plain' or item['name'].lower().endswith('.txt'):
+                    action_buttons.append(InlineKeyboardButton("📖 عرض TXT", callback_data=f'options_txt_gdrive_{item["id"]}'))
+                
+                if action_buttons:
+                    keyboard_buttons_rows.append(action_buttons) # Add row of buttons for this file
+
+        # Pagination buttons
+        pagination_row = []
+        # Simplified: No "Previous" button for now due to GDrive API limitations (no prevPageToken)
+        # If we were on page > 1 (i.e., page_token was not None), a "Previous" button could be constructed
+        # if we stored the token that led to the current page.
+        
+        if next_page_token_from_api:
+            pagination_row.append(InlineKeyboardButton("التالي ⏪", callback_data=f"gdrive_page_{folder_id}_{next_page_token_from_api}"))
+        
+        if pagination_row:
+            keyboard_buttons_rows.append(pagination_row)
+
+        final_message_text = "\n".join(message_text_parts)
+        if not final_message_text: # Should not happen if logic is correct
+            final_message_text = "لا توجد عناصر لعرضها."
+
+        final_reply_markup = InlineKeyboardMarkup(keyboard_buttons_rows) if keyboard_buttons_rows else None
+        
+        if is_callback and message_to_edit_id:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, 
+                message_id=message_to_edit_id, 
+                text=final_message_text, 
+                reply_markup=final_reply_markup,
+                parse_mode='MarkdownV2'
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id, 
+                text=final_message_text, 
+                reply_markup=final_reply_markup,
+                parse_mode='MarkdownV2'
+            )
+
+    except HttpError as http_err:
+        logger.error(f'HttpError listing GDrive files: {http_err}. Response: {http_err.content}')
+        error_message = f'خطأ في عرض ملفات GDrive \\({http_err.resp.status}\\)\\. قد تحتاج إلى إعادة المصادقة إذا انتهت صلاحية الرمز المميز\\. جرب حذف `token\\.json` وإعادة تشغيل الأمر\\.'
+        if is_callback and message_to_edit_id: await context.bot.edit_message_text(chat_id=chat_id, message_id=message_to_edit_id, text=error_message, parse_mode='MarkdownV2')
+        else: await context.bot.send_message(chat_id=chat_id, text=error_message, parse_mode='MarkdownV2')
     except Exception as e:
-        logger.error(f'Error listing GDrive files: {e}')
-        await update.message.reply_text(f'خطأ في عرض ملفات GDrive: {type(e).__name__}')
+        logger.error(f'Error listing GDrive files: {e}', exc_info=True)
+        error_message = f'خطأ غير متوقع في عرض ملفات GDrive: {escape_markdown_v2(str(type(e).__name__))}'
+        if is_callback and message_to_edit_id: await context.bot.edit_message_text(chat_id=chat_id, message_id=message_to_edit_id, text=error_message, parse_mode='MarkdownV2')
+        else: await context.bot.send_message(chat_id=chat_id, text=error_message, parse_mode='MarkdownV2')
+
 
 # --- !!! دالة button_callback الوظيفية (ليست التشخيصية) !!! ---
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -955,6 +1240,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         except Exception as e_final_edit:
             logger.warning(f"Failed to edit status message with TXT content, sending as new: {e_final_edit}")
             await context.bot.send_message(chat_id=chat_id_to_reply, text=processed_text, parse_mode='MarkdownV2')
+
+    elif callback_data.startswith('gdrive_page_'):
+        # Format: gdrive_page_FOLDERID_PAGETOKEN
+        # If PAGETOKEN is 'None' (as string), it means first page of that FOLDERID
+        parts = callback_data.split('_', 3)
+        folder_id_from_cb = parts[2]
+        next_token_from_cb = parts[3] if len(parts) > 3 else None
+        if next_token_from_cb == 'None': # Handle explicit 'None' string if passed
+            next_token_from_cb = None
+            
+        logger.info(f"User {user_id} requested GDrive page. Folder ID: {folder_id_from_cb}, Next Page Token: {next_token_from_cb}")
+        # Call list_gdrive_files_command, making sure `update` is the CallbackQuery object
+        await list_gdrive_files_command(update.callback_query, context, page_token=next_token_from_cb, folder_id=folder_id_from_cb)
 
 
     elif callback_data == 'feedback_useful':
