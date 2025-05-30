@@ -10,6 +10,8 @@ import pandas as pd # <-- لاستيراد pandas
 # تحميل متغيرات البيئة من ملف .env
 load_dotenv()
 
+import json # For JSON processing
+
 from openai import OpenAI
 # import google.generativeai as genai # معطل مؤقتًا
 
@@ -36,7 +38,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaIoBaseUpload
+from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownloader
 
 # --- إعدادات البوت الأساسية ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -540,10 +542,25 @@ async def list_gdrive_files_command(update: Update, context: ContextTypes.DEFAUL
             link = item.get('webViewLink', '')
             name_escaped = item['name'].replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace(']', '\\]').replace('(', '\\(').replace(')', '\\)').replace('~', '\\~').replace('`', '\\`').replace('>', '\\>').replace('#', '\\#').replace('+', '\\+').replace('-', '\\-').replace('=', '\\=').replace('|', '\\|').replace('{', '\\{').replace('}', '\\}').replace('.', '\\.').replace('!', '\\!')
             file_info_line = f"{icon} [{name_escaped}]({link})" if link else f"{icon} {name_escaped}"
+            
+            buttons = []
+            if item['mimeType'] != 'application/vnd.google-apps.folder':
+                buttons.append(InlineKeyboardButton(f"📥 تحميل", callback_data=f'download_gdrive_{item["id"]}'))
+            
+            if item['mimeType'] == 'text/csv': # CSV specific button
+                buttons.append(InlineKeyboardButton(f"📄 اقرأ هذا الـ CSV", callback_data=f'read_csv_{item["id"]}'))
+            
+            if item['mimeType'] == 'application/json' or item['name'].lower().endswith('.json'):
+                buttons.append(InlineKeyboardButton("📊 تحليل JSON", callback_data=f'analyze_json_gdrive_{item["id"]}'))
+            
+            if item['mimeType'] == 'text/plain' or item['name'].lower().endswith('.txt'):
+                buttons.append(InlineKeyboardButton("📖 عرض TXT", callback_data=f'options_txt_gdrive_{item["id"]}'))
+
             reply_markup = None
-            if item['mimeType'] == 'text/csv': # تحقق من نوع الملف CSV
-                keyboard = [[InlineKeyboardButton(f"📄 اقرأ هذا الـ CSV", callback_data=f'read_csv_{item["id"]}')]]
-                reply_markup = InlineKeyboardMarkup(keyboard)
+            if buttons:
+                # InlineKeyboardMarkup expects a list of lists of buttons (rows of buttons)
+                reply_markup = InlineKeyboardMarkup([buttons]) 
+                
             await update.message.reply_text(file_info_line, parse_mode='MarkdownV2', reply_markup=reply_markup)
     except Exception as e:
         logger.error(f'Error listing GDrive files: {e}')
@@ -625,11 +642,320 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         
         # إرسال نتيجة التحليل كرسالة جديدة
         # تأكد من تطهير النص إذا كان سيحتوي على أحرف Markdown خاصة
-        def escape_markdown_v2(text: str) -> str:
-            escape_chars = r'_*[]()~`>#+-.!{}='
-            return "".join(f'\\{char}' if char in escape_chars else char for char in text)
+        # The escape_markdown_v2 function is already globally defined, so we can use it directly.
+        # def escape_markdown_v2(text: str) -> str:
+        #     escape_chars = r'_*[]()~`>#+-.!{}='
+        #     return "".join(f'\\{char}' if char in escape_chars else char for char in text)
 
         await context.bot.send_message(chat_id=chat_id_to_reply, text=escape_markdown_v2(analysis_result), parse_mode='MarkdownV2')
+
+    elif callback_data.startswith('download_gdrive_'):
+        file_id = callback_data.split('_', 2)[2]
+        logger.info(f"User {user_id} requested to download GDrive file ID: {file_id}")
+        original_message_text = query.message.text if query.message else "تجهيز الملف..."
+        
+        try:
+            await query.edit_message_text(text=f"{original_message_text}\n\n---\n📥 جاري تجهيز الملف للتنزيل...")
+        except Exception as e:
+            logger.warning(f"Could not edit original button message for download_gdrive_ action: {e}")
+            await context.bot.send_message(chat_id=chat_id_to_reply, text="📥 جاري تجهيز الملف للتنزيل...")
+
+        await context.bot.send_chat_action(chat_id=chat_id_to_reply, action=ChatAction.UPLOAD_DOCUMENT)
+        
+        service = await get_gdrive_service_async()
+        if not service:
+            await context.bot.send_message(chat_id=chat_id_to_reply, text="فشل الاتصال بـ Google Drive. لا يمكن تنزيل الملف.")
+            # Attempt to revert the "جاري التجهيز" message if possible, or send a new one
+            try:
+                await query.edit_message_text(text=original_message_text + "\n\n---\n❌ فشل الاتصال بالخدمة.")
+            except: pass # Ignore if editing fails
+            return
+
+        def download_gdrive_file_sync(gdrive_service, gdrive_file_id_sync) -> tuple[str | None, bytes | None]:
+            try:
+                file_metadata = gdrive_service.files().get(fileId=gdrive_file_id_sync, fields='name, mimeType').execute()
+                original_file_name_sync = file_metadata.get('name')
+                # mime_type_sync = file_metadata.get('mimeType') # mime_type not strictly needed for sending
+
+                request = gdrive_service.files().get_media(fileId=gdrive_file_id_sync)
+                file_content_stream = io.BytesIO()
+                downloader = MediaIoBaseDownloader(file_content_stream, request)
+                done = False
+                while not done:
+                    status, done = downloader.next_chunk()
+                    if status:
+                        logger.info(f"GDrive Download {gdrive_file_id_sync}: {int(status.progress() * 100)}%.")
+                
+                file_bytes_sync = file_content_stream.getvalue()
+                logger.info(f"Successfully downloaded GDrive file ID: {gdrive_file_id_sync}, Name: {original_file_name_sync}")
+                return original_file_name_sync, file_bytes_sync
+            except HttpError as http_err_sync:
+                logger.error(f"HttpError downloading GDrive file {gdrive_file_id_sync}: {http_err_sync}")
+                return None, None
+            except Exception as e_sync:
+                logger.error(f"General error downloading GDrive file {gdrive_file_id_sync}: {e_sync}")
+                return None, None
+
+        original_file_name, file_bytes = await asyncio.to_thread(download_gdrive_file_sync, service, file_id)
+
+        if original_file_name and file_bytes:
+            try:
+                await context.bot.send_document(chat_id=chat_id_to_reply, document=file_bytes, filename=original_file_name)
+                # Try to edit the original message to indicate completion or remove buttons
+                await query.edit_message_text(text=f"{original_message_text}\n\n---\n✅ تم إرسال الملف: {escape_markdown_v2(original_file_name)}")
+            except Exception as send_exc:
+                logger.error(f"Error sending document or editing message after download for GDrive file ID {file_id}: {send_exc}")
+                await context.bot.send_message(chat_id=chat_id_to_reply, text=f"تم تنزيل الملف '{escape_markdown_v2(original_file_name)}' ولكن حدث خطأ أثناء إرساله لك. حاول مرة أخرى أو تحقق من الرسائل الخاصة.")
+        else:
+            await context.bot.send_message(chat_id=chat_id_to_reply, text="عذرًا، لم أتمكن من تنزيل الملف المحدد من Google Drive.")
+            # Attempt to revert the "جاري التجهيز" message
+            try:
+                await query.edit_message_text(text=original_message_text + "\n\n---\n❌ فشل تنزيل الملف.")
+            except: pass
+
+    elif callback_data.startswith('analyze_json_gdrive_'):
+        file_id = callback_data.split('_', 3)[3] # analyze_json_gdrive_FILEID
+        logger.info(f"User {user_id} requested to analyze GDrive JSON file ID: {file_id}")
+        original_message_text = query.message.text if query.message else "تحليل JSON..."
+
+        try:
+            await query.edit_message_text(text=f"{original_message_text}\n\n---\n📊 جاري تحليل ملف JSON...")
+        except Exception as e:
+            logger.warning(f"Could not edit original button message for analyze_json_gdrive_ action: {e}")
+            await context.bot.send_message(chat_id=chat_id_to_reply, text="📊 جاري تحليل ملف JSON...")
+
+        await context.bot.send_chat_action(chat_id=chat_id_to_reply, action=ChatAction.TYPING)
+        
+        service = await get_gdrive_service_async()
+        if not service:
+            await context.bot.send_message(chat_id=chat_id_to_reply, text="فشل الاتصال بـ Google Drive. لا يمكن تحليل الملف.")
+            try: await query.edit_message_text(text=original_message_text + "\n\n---\n❌ فشل الاتصال بالخدمة.")
+            except: pass
+            return
+
+        def process_json_file_sync(gdrive_service, gdrive_file_id_sync: str) -> str:
+            try:
+                file_metadata = gdrive_service.files().get(fileId=gdrive_file_id_sync, fields='name, size').execute()
+                original_file_name_sync = file_metadata.get('name', 'unknown.json')
+                file_size = int(file_metadata.get('size', 0))
+
+                # Limit file size to 5MB for now
+                if file_size > 5 * 1024 * 1024: # 5MB
+                    logger.warning(f"JSON file {gdrive_file_id_sync} ('{original_file_name_sync}') is too large: {file_size} bytes.")
+                    return f"ملف JSON '{escape_markdown_v2(original_file_name_sync)}' كبير جدًا للتحليل المباشر ({file_size / (1024*1024):.2f} MB)."
+
+                request = gdrive_service.files().get_media(fileId=gdrive_file_id_sync)
+                file_content_stream = io.BytesIO()
+                downloader = MediaIoBaseDownloader(file_content_stream, request)
+                done = False
+                while not done:
+                    status, done = downloader.next_chunk()
+                    # logger.info(f"JSON Download {gdrive_file_id_sync}: {int(status.progress() * 100)}%.") # Can be verbose
+                
+                file_bytes_sync = file_content_stream.getvalue()
+                
+                try:
+                    json_string = file_bytes_sync.decode('utf-8')
+                except UnicodeDecodeError:
+                    logger.error(f"UnicodeDecodeError for JSON file {gdrive_file_id_sync} ('{original_file_name_sync}').")
+                    return f"خطأ في فك ترميز الملف '{escape_markdown_v2(original_file_name_sync)}'. تأكد أنه بصيغة UTF-8."
+
+                try:
+                    data = json.loads(json_string)
+                except json.JSONDecodeError as json_err:
+                    logger.error(f"JSONDecodeError for file {gdrive_file_id_sync} ('{original_file_name_sync}'): {json_err}")
+                    return f"خطأ في تحليل JSON للملف '{escape_markdown_v2(original_file_name_sync)}':\n`{escape_markdown_v2(str(json_err))}`"
+
+                analysis_summary = f"*ملف JSON: {escape_markdown_v2(original_file_name_sync)}*\n"
+                
+                if isinstance(data, list):
+                    try:
+                        df = pd.json_normalize(data)
+                        # df = pd.DataFrame(data) # Alternative for simple list of dicts
+                        analysis_summary += f"تم تحويل القائمة إلى جدول بيانات \\({len(df)} صفوف, {len(df.columns)} أعمدة\\)\\.\n"
+                        analysis_summary += f"*الأعمدة:* `{escape_markdown_v2(', '.join(df.columns))}`\n"
+                        if not df.empty:
+                             analysis_summary += f"*أول 3 صفوف:*\n```\n{df.head(3).to_string()}\n```"
+                        else:
+                            analysis_summary += "الجدول الناتج فارغ."
+                    except Exception as e_df:
+                        logger.error(f"Error converting JSON list to DataFrame for file '{original_file_name_sync}': {e_df}")
+                        analysis_summary += "القائمة معقدة ولم يتم تحويلها مباشرة إلى جدول قياسي\\. قد تحتاج إلى تحديد مسار معين للبيانات داخل القائمة\\."
+
+                elif isinstance(data, dict):
+                    analysis_summary += "الملف يحتوي على كائن JSON\\. *المفاتيح الرئيسية:* `" + escape_markdown_v2(", ".join(data.keys())) + "`\n"
+                    # Try to find a list of records within the dictionary
+                    processed_nested_list = False
+                    for key, value in data.items():
+                        if isinstance(value, list) and value and all(isinstance(i, dict) for i in value):
+                            try:
+                                df = pd.json_normalize(value)
+                                analysis_summary += f"\nتم العثور على قائمة داخل المفتاح '{escape_markdown_v2(key)}' وتحويلها إلى جدول \\({len(df)} صفوف, {len(df.columns)} أعمدة\\):\n"
+                                analysis_summary += f"*الأعمدة:* `{escape_markdown_v2(', '.join(df.columns))}`\n"
+                                if not df.empty:
+                                    analysis_summary += f"*أول 3 صفوف:*\n```\n{df.head(3).to_string()}\n```\n"
+                                else:
+                                    analysis_summary += "الجدول الناتج من القائمة المتداخلة فارغ.\n"
+                                processed_nested_list = True
+                                break # Process first such list for now
+                            except Exception as e_df_nested:
+                                logger.error(f"Error converting nested list under key '{key}' to DataFrame for file '{original_file_name_sync}': {e_df_nested}")
+                                analysis_summary += f"تعذر تحويل القائمة المتداخلة تحت المفتاح '{escape_markdown_v2(key)}' إلى جدول قياسي.\n"
+                    if not processed_nested_list:
+                         analysis_summary += "لم يتم العثور على قائمة بسيطة من السجلات داخل الكائن لتحويلها لجدول تلقائيًا."
+                else:
+                    analysis_summary += "صيغة JSON غير مدعومة للتحليل المتقدم حاليًا \\(ليست قائمة أو كائن قياسي\\)\\."
+                
+                return analysis_summary
+
+            except HttpError as http_err_sync:
+                logger.error(f"HttpError processing JSON file {gdrive_file_id_sync}: {http_err_sync}")
+                return f"خطأ في الوصول لملف JSON (ID: {gdrive_file_id_sync}) على Google Drive."
+            except Exception as e_sync:
+                logger.error(f"General error processing JSON file {gdrive_file_id_sync}: {e_sync}")
+                return f"خطأ عام أثناء معالجة ملف JSON (ID: {gdrive_file_id_sync}): {type(e_sync).__name__}"
+
+        analysis_result = await asyncio.to_thread(process_json_file_sync, service, file_id)
+        
+        try:
+            await query.edit_message_text(text=analysis_result, parse_mode='MarkdownV2')
+        except Exception as e_edit: # If message is too long or contains problematic markdown
+            logger.warning(f"Failed to edit message with JSON analysis, sending as new: {e_edit}")
+            await context.bot.send_message(chat_id=chat_id_to_reply, text=analysis_result, parse_mode='MarkdownV2')
+
+    elif callback_data.startswith('options_txt_gdrive_'):
+        file_id = callback_data.split('_', 3)[3] # options_txt_gdrive_FILEID
+        logger.info(f"User {user_id} requested options for GDrive TXT file ID: {file_id}")
+        
+        # Fetch file name to display in the options message
+        service = await get_gdrive_service_async()
+        if not service:
+            await query.edit_message_text(text="فشل الاتصال بـ Google Drive. لا يمكن عرض خيارات الملف.")
+            return
+        
+        try:
+            file_metadata = await asyncio.to_thread(service.files().get(fileId=file_id, fields='name').execute)
+            original_file_name = file_metadata.get('name', 'file.txt')
+        except Exception as e_meta:
+            logger.error(f"Error fetching metadata for TXT options (ID: {file_id}): {e_meta}")
+            await query.edit_message_text(text="خطأ في جلب معلومات الملف لعرض الخيارات.")
+            return
+
+        txt_options_keyboard = [
+            [InlineKeyboardButton(" عرض أول 100 سطر", callback_data=f"view_txt_head_{file_id}")],
+            [InlineKeyboardButton(" عرض آخر 100 سطر", callback_data=f"view_txt_tail_{file_id}")],
+            # [InlineKeyboardButton("بحث عن كلمة (قريبًا)", callback_data=f"search_txt_{file_id}_disabled")]
+        ]
+        options_markup = InlineKeyboardMarkup(txt_options_keyboard)
+        try:
+            await query.edit_message_text(
+                text=f"اختر إجراء لملف TXT: '{escape_markdown_v2(original_file_name)}'",
+                reply_markup=options_markup,
+                parse_mode='MarkdownV2'
+            )
+        except Exception as e_edit_options:
+            logger.error(f"Error editing message to show TXT options: {e_edit_options}")
+            # Fallback if edit fails (e.g. message too old, or content identical)
+            await context.bot.send_message(
+                chat_id=chat_id_to_reply,
+                text=f"اختر إجراء لملف TXT: '{escape_markdown_v2(original_file_name)}'",
+                reply_markup=options_markup,
+                parse_mode='MarkdownV2'
+            )
+            
+    elif callback_data.startswith('view_txt_head_') or callback_data.startswith('view_txt_tail_'):
+        mode = 'head' if callback_data.startswith('view_txt_head_') else 'tail'
+        file_id = callback_data.split('_', 3)[3] # view_txt_head_FILEID or view_txt_tail_FILEID
+        
+        logger.info(f"User {user_id} requested to view {mode} of GDrive TXT file ID: {file_id}")
+        
+        # It's better to send a new message for the processing status, 
+        # rather than editing the message that contains the options keyboard.
+        status_message = await context.bot.send_message(chat_id=chat_id_to_reply, text=f"📖 جاري معالجة ملف TXT ({mode})...")
+        await context.bot.send_chat_action(chat_id=chat_id_to_reply, action=ChatAction.TYPING)
+
+        service = await get_gdrive_service_async()
+        if not service:
+            await context.bot.edit_message_text(chat_id=status_message.chat_id, message_id=status_message.message_id, text="فشل الاتصال بـ Google Drive.")
+            return
+
+        def process_txt_file_sync(gdrive_service, gdrive_file_id_sync: str, view_mode: str) -> str:
+            try:
+                file_metadata = gdrive_service.files().get(fileId=gdrive_file_id_sync, fields='name, size').execute()
+                original_file_name_sync = file_metadata.get('name', 'file.txt')
+                file_size = int(file_metadata.get('size', 0))
+
+                # Limit file size for viewing (e.g., 2MB)
+                if file_size > 2 * 1024 * 1024: # 2MB
+                    logger.warning(f"TXT file {gdrive_file_id_sync} ('{original_file_name_sync}') is too large for viewing: {file_size} bytes.")
+                    return f"ملف TXT '{escape_markdown_v2(original_file_name_sync)}' كبير جدًا للعرض المباشر ({file_size / (1024*1024):.2f} MB)."
+
+                request = gdrive_service.files().get_media(fileId=gdrive_file_id_sync)
+                file_content_stream = io.BytesIO()
+                downloader = MediaIoBaseDownloader(file_content_stream, request)
+                done = False
+                while not done:
+                    status, done = downloader.next_chunk()
+                
+                file_bytes_sync = file_content_stream.getvalue()
+                
+                try:
+                    # Try common encodings, starting with utf-8
+                    encodings_to_try = ['utf-8', 'iso-8859-1', 'windows-1256'] # windows-1256 for Arabic
+                    text_content = None
+                    for enc in encodings_to_try:
+                        try:
+                            text_content = file_bytes_sync.decode(enc)
+                            logger.info(f"Decoded TXT file {gdrive_file_id_sync} with {enc}")
+                            break
+                        except UnicodeDecodeError:
+                            logger.debug(f"Failed to decode TXT {gdrive_file_id_sync} with {enc}")
+                    
+                    if text_content is None:
+                        logger.error(f"Could not decode TXT file {gdrive_file_id_sync} with common encodings.")
+                        return f"خطأ في فك ترميز الملف '{escape_markdown_v2(original_file_name_sync)}'. قد يكون الترميز غير مدعوم."
+
+                except UnicodeDecodeError: # Should be caught by the loop above
+                    logger.error(f"UnicodeDecodeError for TXT file {gdrive_file_id_sync} ('{original_file_name_sync}').")
+                    return f"خطأ في فك ترميز الملف '{escape_markdown_v2(original_file_name_sync)}'."
+
+                lines = text_content.splitlines()
+                
+                if view_mode == 'head':
+                    selected_lines = lines[:100]
+                    result_header = f"أول 100 سطر من ملف '{escape_markdown_v2(original_file_name_sync)}':\n"
+                else: # tail
+                    selected_lines = lines[-100:]
+                    result_header = f"آخر 100 سطر من ملف '{escape_markdown_v2(original_file_name_sync)}':\n"
+                
+                output_text = "\n".join(selected_lines)
+                
+                if not output_text.strip():
+                    return f"{result_header}\n(لا يوجد محتوى لعرضه في هذا الجزء من الملف)"
+
+                # Truncate if too long for a Telegram message (4096 chars limit)
+                max_len = 4000 # Leave some room for header and markdown code block
+                if len(output_text) > max_len:
+                    output_text = output_text[:max_len] + "\n... (تم اقتطاع النص لطوله الزائد)"
+                
+                return f"{result_header}```\n{output_text}\n```" # Using Markdown code block
+
+            except HttpError as http_err_sync:
+                logger.error(f"HttpError processing TXT file {gdrive_file_id_sync}: {http_err_sync}")
+                return f"خطأ في الوصول لملف TXT (ID: {gdrive_file_id_sync}) على Google Drive."
+            except Exception as e_sync:
+                logger.error(f"General error processing TXT file {gdrive_file_id_sync}: {e_sync}")
+                return f"خطأ عام أثناء معالجة ملف TXT (ID: {gdrive_file_id_sync}): {type(e_sync).__name__}"
+
+        processed_text = await asyncio.to_thread(process_txt_file_sync, service, file_id, mode)
+        
+        # Edit the "جاري المعالجة" message with the result or send a new one if it's too long / causes issues
+        try:
+             await context.bot.edit_message_text(chat_id=status_message.chat_id, message_id=status_message.message_id, text=processed_text, parse_mode='MarkdownV2')
+        except Exception as e_final_edit:
+            logger.warning(f"Failed to edit status message with TXT content, sending as new: {e_final_edit}")
+            await context.bot.send_message(chat_id=chat_id_to_reply, text=processed_text, parse_mode='MarkdownV2')
+
 
     elif callback_data == 'feedback_useful':
         try:
