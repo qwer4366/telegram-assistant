@@ -13,6 +13,7 @@ load_dotenv()
 import json # For JSON processing
 import csv # For CSV schema extraction
 import re # For parsing --file in /askdata
+from rapidfuzz import fuzz, process as rapidfuzz_process # For fuzzy file name matching
 
 from openai import OpenAI
 # import google.generativeai as genai # معطل مؤقتًا
@@ -99,13 +100,13 @@ def sync_extract_text_from_pdf(pdf_bytes: bytes) -> tuple[int, str]:
             # Re-iterate for OCR if doc is still valid for page loading
             # If `doc.load_page` fails after initial text extraction, `doc` would need to be reopened.
             # This example assumes `doc` can still be used. A more robust solution might re-open from `pdf_bytes`.
-            
+
             # Ensure doc is re-opened if it was closed or stream was fully consumed.
             # For this implementation, we'll assume `doc` is from the initial try block and still usable.
             # If `page.get_text()` fully consumes parts of the stream needed by `get_pixmap`,
             # then `doc` should be reopened using a fresh BytesIO stream from `pdf_bytes`.
             # Let's try to use the existing 'doc' and pages.
-            
+
             # If initial text extraction already iterated through pages, the `doc` object is fine.
 
             for page_num in range(num_pages):
@@ -124,7 +125,7 @@ def sync_extract_text_from_pdf(pdf_bytes: bytes) -> tuple[int, str]:
                 except Exception as ocr_exc:
                     logger.error(f"Error during OCR for page {page_num + 1}: {ocr_exc}")
                     # Continue to next page or return what we have / original text
-            
+
             if ocr_full_text.strip():
                 logger.info("OCR process yielded text. Using OCR text.")
                 text = ocr_full_text
@@ -210,13 +211,13 @@ def upload_to_gdrive_sync(gdrive_service, file_bytes: bytes, file_name: str, mim
         file_metadata = {'name': file_name}
         if folder_id and folder_id.strip() != "": # Ensure folder_id is not empty or just whitespace
             file_metadata['parents'] = [folder_id]
-        
+
         created_file = gdrive_service.files().create(
             body=file_metadata,
             media_body=media_body,
             fields='id, webViewLink'
         ).execute()
-        
+
         file_link = created_file.get('webViewLink')
         logger.info(f"Uploaded file '{file_name}' to Drive. ID: {created_file.get('id')}, Link: {file_link}")
         return file_link
@@ -257,36 +258,58 @@ async def get_openai_response(api_key: str, messages: list) -> str:
 # --- Funciones para Búsqueda de Archivos y Schema en Google Drive ---
 def find_file_in_gdrive_sync(gdrive_service, filename_query: str) -> tuple[str | None, str | None, str | None]:
     try:
-        # Escape single quotes in filename query for safety with Drive API
-        escaped_filename_query = filename_query.replace("'", "\\'")
-        drive_query = f"name = '{escaped_filename_query}' and trashed = false"
-        
-        logger.info(f"Searching for file in GDrive with query: {drive_query}")
+        # Fetch a broader set of files to perform fuzzy matching on
+        # For now, fetching from root, ordered by most recent. This can be refined.
+        # Consider targetting specific folders if context allows, or increasing pageSize if necessary.
+        drive_query = "trashed = false and mimeType != 'application/vnd.google-apps.folder'" # Exclude folders from fuzzy search pool for now
+        logger.info(f"Fetching up to 100 files from GDrive for fuzzy matching against: '{filename_query}'")
         results = gdrive_service.files().list(
             q=drive_query,
-            pageSize=5, # Limit results, take the first one if multiple exact matches (rare for full names)
+            pageSize=100,  # Fetch a decent pool of candidates
+            orderBy="modifiedTime desc",
             fields="files(id, name, mimeType)"
         ).execute()
-        
+
         items = results.get('files', [])
-        if items:
-            first_item = items[0]
-            logger.info(f"Found {len(items)} file(s) matching '{filename_query}'. Using first: ID {first_item.get('id')}, Name: {first_item.get('name')}, MIME: {first_item.get('mimeType')}")
-            return first_item.get('id'), first_item.get('name'), first_item.get('mimeType')
-        else:
-            logger.info(f"No file found matching '{filename_query}' in GDrive.")
+        if not items:
+            logger.info("No files found in GDrive to perform fuzzy matching.")
             return None, None, None
+
+        # Prepare choices for rapidfuzz: a dictionary mapping file ID to file name
+        choices = {item['id']: item['name'] for item in items}
+
+        # Use rapidfuzz to find the best match above a certain score cutoff
+        # WRatio is good for finding matches even when words are out of order or strings are of different lengths
+        best_match = rapidfuzz_process.extractOne(filename_query, choices, scorer=fuzz.WRatio, score_cutoff=70) # score_cutoff (0-100)
+
+        if best_match:
+            # best_match is a tuple: (matched_name_from_choices, score, original_key_from_choices (which is file_id))
+            matched_name_str, score, file_id_str = best_match
+            logger.info(f"Fuzzy match for '{filename_query}': Found '{matched_name_str}' (ID: {file_id_str}) with score {score:.2f}%.")
+
+            # Retrieve the original item to get its mimeType
+            original_item = next((item for item in items if item['id'] == file_id_str), None)
+            if original_item:
+                return original_item.get('id'), original_item.get('name'), original_item.get('mimeType')
+            else:
+                # This should ideally not happen if file_id_str came from our choices keys
+                logger.error(f"Consistency error: Could not find original item for ID {file_id_str} after fuzzy matching.")
+                return None, None, None
+        else:
+            logger.info(f"No suitable fuzzy match found for '{filename_query}' with cutoff 70%.")
+            return None, None, None
+
     except HttpError as error:
-        logger.error(f"HttpError during GDrive file search for '{filename_query}': {error}")
+        logger.error(f"HttpError during GDrive file list for fuzzy matching '{filename_query}': {error}")
         return None, None, None
     except Exception as e:
-        logger.error(f"General error during GDrive file search for '{filename_query}': {e}", exc_info=True)
+        logger.error(f"General error during GDrive file list for fuzzy matching '{filename_query}': {e}", exc_info=True)
         return None, None, None
 
 async def find_file_in_gdrive_async(gdrive_service, filename_query: str) -> tuple[str | None, str | None, str | None]:
     return await asyncio.to_thread(find_file_in_gdrive_sync, gdrive_service, filename_query)
 
-def get_schema_from_file_sync(gdrive_service, file_id: str, mime_type: str) -> str | None:
+def get_schema_from_file_sync(gdrive_service, file_id: str, mime_type: str) -> list[str] | None: # Return type updated
     try:
         logger.info(f"Attempting to download file ID {file_id} for schema extraction (MIME: {mime_type}).")
         request = gdrive_service.files().get_media(fileId=file_id)
@@ -296,7 +319,7 @@ def get_schema_from_file_sync(gdrive_service, file_id: str, mime_type: str) -> s
         while not done:
             status, done = downloader.next_chunk()
             # logger.debug(f"Schema download progress: {int(status.progress() * 100)}%.") # Can be verbose
-        
+
         file_bytes = file_content_stream.getvalue()
         logger.info(f"File ID {file_id} downloaded successfully for schema extraction.")
 
@@ -313,7 +336,7 @@ def get_schema_from_file_sync(gdrive_service, file_id: str, mime_type: str) -> s
                         break
                     except UnicodeDecodeError:
                         logger.debug(f"Failed to decode CSV {file_id} with {encoding}.")
-                
+
                 if text_content is None:
                     logger.error(f"Could not decode CSV {file_id} with any common encoding.")
                     return "تعذر فك ترميز ملف CSV باستخدام الترميزات الشائعة."
@@ -414,7 +437,7 @@ def perform_actual_search_sync(gdrive_service, file_id: str, mime_type: str, col
         filtered_df = None
         # For robust comparison, convert column to string for string operations,
         # and attempt numeric conversion for numeric operations.
-        
+
         col_as_str = df[column_name].astype(str)
         search_value_lower = search_value.lower()
 
@@ -459,7 +482,7 @@ def perform_actual_search_sync(gdrive_service, file_id: str, mime_type: str, col
         if filtered_df is None: # Should ideally not happen if all paths lead to assignment or error return
              logger.error(f"filtered_df remained None for match_type '{match_type}' - this indicates a logic flaw.")
              return "خطأ في تطبيق الفلتر. لم يتم تحديد نتائج."
-        
+
         logger.info(f"Search for '{search_value}' in column '{column_name}' with match type '{match_type}' yielded {len(filtered_df)} results.")
         return filtered_df
 
@@ -479,7 +502,7 @@ async def perform_actual_search_async(gdrive_service, file_id: str, mime_type: s
 async def handle_pdf_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Received a PDF file from user {update.effective_user.id} - Name: {update.message.document.file_name}")
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-    
+
     # Inform the user that processing has started
     processing_message = await update.message.reply_text("جاري معالجة ملف PDF، يرجى الانتظار...")
 
@@ -488,7 +511,7 @@ async def handle_pdf_document(update: Update, context: ContextTypes.DEFAULT_TYPE
         pdf_file = await context.bot.get_file(file_id)
         # Using download_as_bytearray first, then converting to bytes
         pdf_bytearray = await pdf_file.download_as_bytearray()
-        pdf_bytes = bytes(pdf_bytearray) 
+        pdf_bytes = bytes(pdf_bytearray)
 
         num_pages, extracted_text = await extract_text_from_pdf(pdf_bytes)
 
@@ -504,7 +527,7 @@ async def handle_pdf_document(update: Update, context: ContextTypes.DEFAULT_TYPE
                 return "".join(f'\\{char}' if char in escape_chars else char for char in text)
 
             text_preview_escaped = escape_md_v2(extracted_text[:200])
-            
+
             reply_text = (
                 f"تمت معالجة ملف PDF بنجاح\\.\n"
                 f"عدد الصفحات: {num_pages}\n\n"
@@ -512,7 +535,7 @@ async def handle_pdf_document(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"{text_preview_escaped}"
             )
             logger.info(f"Successfully extracted text from PDF file_id: {file_id}. Pages: {num_pages}. Preview: {extracted_text[:50]}...")
-        
+
         # Edit the "Processing..." message with the result
         await context.bot.edit_message_text(chat_id=processing_message.chat_id, message_id=processing_message.message_id, text=reply_text, parse_mode='MarkdownV2')
 
@@ -543,9 +566,9 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
     mime_type = doc.mime_type or "application/octet-stream"  # Default MIME type
 
     logger.info(f"Received document: '{original_file_name}' (MIME: {mime_type}, ID: {file_id}) for GDrive upload.")
-    
+
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.UPLOAD_DOCUMENT)
-    
+
     try:
         bot_file = await context.bot.get_file(file_id)
         file_bytes_array = await bot_file.download_as_bytearray()
@@ -569,7 +592,7 @@ async def handle_document_upload(update: Update, context: ContextTypes.DEFAULT_T
             escaped_file_name = escape_markdown_v2(original_file_name)
             reply_text = f"حدث خطأ أثناء محاولة رفع الملف '{escaped_file_name}' إلى Google Drive\\."
             await update.message.reply_text(reply_text, parse_mode='MarkdownV2')
-            
+
     except Exception as e:
         logger.error(f"Unexpected error in handle_document_upload for '{original_file_name}': {type(e).__name__} - {e}")
         escaped_file_name = escape_markdown_v2(original_file_name)
@@ -585,7 +608,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "▫️ /qr <نص> - لإنشاء QR Code\n"
         "▫️ /testai <سؤال> - لطرح سؤال على OpenAI\n"
         # The buttons will now represent these actions primarily
-        # "▫️ /gdrivefiles - لعرض ملفات Google Drive\n" 
+        # "▫️ /gdrivefiles - لعرض ملفات Google Drive\n"
         # "▫️ /askdata <سؤال> - لطرح سؤال عن بياناتك\n"
         "This bot is being enhanced by Jules!\n"
     )
@@ -597,8 +620,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Future buttons like "⚙️ إعدادات" or "🆘 مساعدة" can be added here
     ]
     reply_markup = ReplyKeyboardMarkup(
-        main_keyboard_layout, 
-        resize_keyboard=True, 
+        main_keyboard_layout,
+        resize_keyboard=True,
         one_time_keyboard=False # Keep the keyboard open until explicitly closed
     )
 
@@ -726,7 +749,7 @@ async def askdata_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     full_text_args = " ".join(context.args)
-    
+
     # Parse question and filename
     user_question_text = full_text_args
     target_file_name_query = None
@@ -763,15 +786,15 @@ async def askdata_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if found_file_id:
                 await context.bot.edit_message_text(chat_id=thinking_message.chat_id, message_id=thinking_message.message_id, text=f"تم العثور على ملف '{escape_markdown_v2(found_file_name)}'. جاري استخلاص مخطط البيانات...")
-                
+
                 # Check MIME type for compatibility (CSV/Excel)
                 compatible_mime_types = ['text/csv', 'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet']
                 if found_mime_type in compatible_mime_types:
                     target_file_id_for_openai = found_file_id
                     target_mime_type_for_openai = found_mime_type
-                    
+
                     schema_description_for_openai = await get_schema_from_file_async(service, target_file_id_for_openai, target_mime_type_for_openai)
-                    
+
                     if schema_description_for_openai:
                         file_context_message = f"\n\nتم العثور على ملف باسم '{escape_markdown_v2(found_file_name)}' من نوع '{target_mime_type_for_openai}'. {schema_description_for_openai}."
                         await context.bot.edit_message_text(chat_id=thinking_message.chat_id, message_id=thinking_message.message_id, text=f"تم استخلاص مخطط البيانات لملف '{escape_markdown_v2(found_file_name)}'. الآن أفكر في إجابة سؤالك...")
@@ -784,7 +807,7 @@ async def askdata_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 file_context_message = f"\n\nلم أتمكن من العثور على ملف بالاسم '{escape_markdown_v2(target_file_name_query)}' في Google Drive. سأحاول الإجابة على سؤالك بدون سياق الملف."
                 await context.bot.edit_message_text(chat_id=thinking_message.chat_id, message_id=thinking_message.message_id, text=file_context_message)
-    
+
     # Construct the messages list for OpenAI
     system_message_content = "أنت مساعد ذكاء اصطناعي متخصص في تحليل البيانات والإجابة على الأسئلة المتعلقة بها. "
     if schema_description_for_openai: # This now implies a file was found and schema extracted
@@ -800,7 +823,7 @@ async def askdata_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
          )
     else: # No file specified
         system_message_content += "المستخدم يسأل سؤالاً عاماً عن البيانات. "
-    
+
     system_message_content += (
         "حاول الإجابة على سؤاله بشكل مباشر ومفيد. "
         "إذا كان السؤال يتطلب عملية حسابية معقدة أو البحث في ملف بيانات ولم يكن لديك وصول مباشر للملف (أو لم يتم تحديد ملف صالح)، "
@@ -865,7 +888,7 @@ async def list_gdrive_files_command(update: Update, context: ContextTypes.DEFAUL
 
     try:
         logger.info(f"User {user_id} requested GDrive files. Folder: '{folder_id}', PageToken: '{page_token}'")
-        
+
         drive_query = f"'{folder_id}' in parents and trashed=false"
         page_size = 10 # Number of files per page
 
@@ -881,7 +904,7 @@ async def list_gdrive_files_command(update: Update, context: ContextTypes.DEFAUL
         results = await asyncio.to_thread(list_files_sync)
         items = results.get('files', [])
         next_page_token_from_api = results.get('nextPageToken')
-        
+
         message_text_parts = []
         keyboard_buttons_rows = [] # Each element is a row of buttons
 
@@ -895,27 +918,27 @@ async def list_gdrive_files_command(update: Update, context: ContextTypes.DEFAUL
                 icon = "📁" if item['mimeType'] == 'application/vnd.google-apps.folder' else "📄"
                 link = item.get('webViewLink', '') # Not used directly in message to save space, but good for logs
                 file_name_escaped = escape_markdown_v2(item['name'])
-                
+
                 # Each file/folder will have its own message or be part of a list in one message.
                 # For simplicity with inline buttons, sending one message per item is easier if buttons are complex.
                 # However, to use pagination buttons effectively, all items for a page should be in ONE message.
-                
+
                 file_info_line = f"{icon} {file_name_escaped}"
                 message_text_parts.append(file_info_line)
 
                 action_buttons = []
                 if item['mimeType'] != 'application/vnd.google-apps.folder':
                     action_buttons.append(InlineKeyboardButton("📥 تحميل", callback_data=f'download_gdrive_{item["id"]}'))
-                
+
                 if item['mimeType'] == 'text/csv':
                     action_buttons.append(InlineKeyboardButton("📄 اقرأ CSV", callback_data=f'read_csv_{item["id"]}'))
-                
+
                 if item['mimeType'] == 'application/json' or item['name'].lower().endswith('.json'):
                     action_buttons.append(InlineKeyboardButton("📊 تحليل JSON", callback_data=f'analyze_json_gdrive_{item["id"]}'))
-                
+
                 if item['mimeType'] == 'text/plain' or item['name'].lower().endswith('.txt'):
                     action_buttons.append(InlineKeyboardButton("📖 عرض TXT", callback_data=f'options_txt_gdrive_{item["id"]}'))
-                
+
                 if action_buttons:
                     keyboard_buttons_rows.append(action_buttons) # Add row of buttons for this file
 
@@ -924,10 +947,10 @@ async def list_gdrive_files_command(update: Update, context: ContextTypes.DEFAUL
         # Simplified: No "Previous" button for now due to GDrive API limitations (no prevPageToken)
         # If we were on page > 1 (i.e., page_token was not None), a "Previous" button could be constructed
         # if we stored the token that led to the current page.
-        
+
         if next_page_token_from_api:
             pagination_row.append(InlineKeyboardButton("التالي ⏪", callback_data=f"gdrive_page_{folder_id}_{next_page_token_from_api}"))
-        
+
         if pagination_row:
             keyboard_buttons_rows.append(pagination_row)
 
@@ -936,19 +959,19 @@ async def list_gdrive_files_command(update: Update, context: ContextTypes.DEFAUL
             final_message_text = "لا توجد عناصر لعرضها."
 
         final_reply_markup = InlineKeyboardMarkup(keyboard_buttons_rows) if keyboard_buttons_rows else None
-        
+
         if is_callback and message_to_edit_id:
             await context.bot.edit_message_text(
-                chat_id=chat_id, 
-                message_id=message_to_edit_id, 
-                text=final_message_text, 
+                chat_id=chat_id,
+                message_id=message_to_edit_id,
+                text=final_message_text,
                 reply_markup=final_reply_markup,
                 parse_mode='MarkdownV2'
             )
         else:
             await context.bot.send_message(
-                chat_id=chat_id, 
-                text=final_message_text, 
+                chat_id=chat_id,
+                text=final_message_text,
                 reply_markup=final_reply_markup,
                 parse_mode='MarkdownV2'
             )
@@ -1052,7 +1075,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         file_id = callback_data.split('_', 2)[2]
         logger.info(f"User {user_id} requested to download GDrive file ID: {file_id}")
         original_message_text = query.message.text if query.message else "تجهيز الملف..."
-        
+
         try:
             await query.edit_message_text(text=f"{original_message_text}\n\n---\n📥 جاري تجهيز الملف للتنزيل...")
         except Exception as e:
@@ -1060,7 +1083,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await context.bot.send_message(chat_id=chat_id_to_reply, text="📥 جاري تجهيز الملف للتنزيل...")
 
         await context.bot.send_chat_action(chat_id=chat_id_to_reply, action=ChatAction.UPLOAD_DOCUMENT)
-        
+
         service = await get_gdrive_service_async()
         if not service:
             await context.bot.send_message(chat_id=chat_id_to_reply, text="فشل الاتصال بـ Google Drive. لا يمكن تنزيل الملف.")
@@ -1084,7 +1107,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     status, done = downloader.next_chunk()
                     if status:
                         logger.info(f"GDrive Download {gdrive_file_id_sync}: {int(status.progress() * 100)}%.")
-                
+
                 file_bytes_sync = file_content_stream.getvalue()
                 logger.info(f"Successfully downloaded GDrive file ID: {gdrive_file_id_sync}, Name: {original_file_name_sync}")
                 return original_file_name_sync, file_bytes_sync
@@ -1124,7 +1147,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await context.bot.send_message(chat_id=chat_id_to_reply, text="📊 جاري تحليل ملف JSON...")
 
         await context.bot.send_chat_action(chat_id=chat_id_to_reply, action=ChatAction.TYPING)
-        
+
         service = await get_gdrive_service_async()
         if not service:
             await context.bot.send_message(chat_id=chat_id_to_reply, text="فشل الاتصال بـ Google Drive. لا يمكن تحليل الملف.")
@@ -1150,9 +1173,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 while not done:
                     status, done = downloader.next_chunk()
                     # logger.info(f"JSON Download {gdrive_file_id_sync}: {int(status.progress() * 100)}%.") # Can be verbose
-                
+
                 file_bytes_sync = file_content_stream.getvalue()
-                
+
                 try:
                     json_string = file_bytes_sync.decode('utf-8')
                 except UnicodeDecodeError:
@@ -1166,7 +1189,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     return f"خطأ في تحليل JSON للملف '{escape_markdown_v2(original_file_name_sync)}':\n`{escape_markdown_v2(str(json_err))}`"
 
                 analysis_summary = f"*ملف JSON: {escape_markdown_v2(original_file_name_sync)}*\n"
-                
+
                 if isinstance(data, list):
                     try:
                         df = pd.json_normalize(data)
@@ -1204,7 +1227,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                          analysis_summary += "لم يتم العثور على قائمة بسيطة من السجلات داخل الكائن لتحويلها لجدول تلقائيًا."
                 else:
                     analysis_summary += "صيغة JSON غير مدعومة للتحليل المتقدم حاليًا \\(ليست قائمة أو كائن قياسي\\)\\."
-                
+
                 return analysis_summary
 
             except HttpError as http_err_sync:
@@ -1215,7 +1238,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return f"خطأ عام أثناء معالجة ملف JSON (ID: {gdrive_file_id_sync}): {type(e_sync).__name__}"
 
         analysis_result = await asyncio.to_thread(process_json_file_sync, service, file_id)
-        
+
         try:
             await query.edit_message_text(text=analysis_result, parse_mode='MarkdownV2')
         except Exception as e_edit: # If message is too long or contains problematic markdown
@@ -1225,13 +1248,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     elif callback_data.startswith('options_txt_gdrive_'):
         file_id = callback_data.split('_', 3)[3] # options_txt_gdrive_FILEID
         logger.info(f"User {user_id} requested options for GDrive TXT file ID: {file_id}")
-        
+
         # Fetch file name to display in the options message
         service = await get_gdrive_service_async()
         if not service:
             await query.edit_message_text(text="فشل الاتصال بـ Google Drive. لا يمكن عرض خيارات الملف.")
             return
-        
+
         try:
             file_metadata = await asyncio.to_thread(service.files().get(fileId=file_id, fields='name').execute)
             original_file_name = file_metadata.get('name', 'file.txt')
@@ -1261,14 +1284,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 reply_markup=options_markup,
                 parse_mode='MarkdownV2'
             )
-            
+
     elif callback_data.startswith('view_txt_head_') or callback_data.startswith('view_txt_tail_'):
         mode = 'head' if callback_data.startswith('view_txt_head_') else 'tail'
         file_id = callback_data.split('_', 3)[3] # view_txt_head_FILEID or view_txt_tail_FILEID
-        
+
         logger.info(f"User {user_id} requested to view {mode} of GDrive TXT file ID: {file_id}")
-        
-        # It's better to send a new message for the processing status, 
+
+        # It's better to send a new message for the processing status,
         # rather than editing the message that contains the options keyboard.
         status_message = await context.bot.send_message(chat_id=chat_id_to_reply, text=f"📖 جاري معالجة ملف TXT ({mode})...")
         await context.bot.send_chat_action(chat_id=chat_id_to_reply, action=ChatAction.TYPING)
@@ -1295,9 +1318,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 done = False
                 while not done:
                     status, done = downloader.next_chunk()
-                
+
                 file_bytes_sync = file_content_stream.getvalue()
-                
+
                 try:
                     # Try common encodings, starting with utf-8
                     encodings_to_try = ['utf-8', 'iso-8859-1', 'windows-1256'] # windows-1256 for Arabic
@@ -1309,7 +1332,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                             break
                         except UnicodeDecodeError:
                             logger.debug(f"Failed to decode TXT {gdrive_file_id_sync} with {enc}")
-                    
+
                     if text_content is None:
                         logger.error(f"Could not decode TXT file {gdrive_file_id_sync} with common encodings.")
                         return f"خطأ في فك ترميز الملف '{escape_markdown_v2(original_file_name_sync)}'. قد يكون الترميز غير مدعوم."
@@ -1319,16 +1342,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     return f"خطأ في فك ترميز الملف '{escape_markdown_v2(original_file_name_sync)}'."
 
                 lines = text_content.splitlines()
-                
+
                 if view_mode == 'head':
                     selected_lines = lines[:100]
                     result_header = f"أول 100 سطر من ملف '{escape_markdown_v2(original_file_name_sync)}':\n"
                 else: # tail
                     selected_lines = lines[-100:]
                     result_header = f"آخر 100 سطر من ملف '{escape_markdown_v2(original_file_name_sync)}':\n"
-                
+
                 output_text = "\n".join(selected_lines)
-                
+
                 if not output_text.strip():
                     return f"{result_header}\n(لا يوجد محتوى لعرضه في هذا الجزء من الملف)"
 
@@ -1336,7 +1359,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 max_len = 4000 # Leave some room for header and markdown code block
                 if len(output_text) > max_len:
                     output_text = output_text[:max_len] + "\n... (تم اقتطاع النص لطوله الزائد)"
-                
+
                 return f"{result_header}```\n{output_text}\n```" # Using Markdown code block
 
             except HttpError as http_err_sync:
@@ -1347,7 +1370,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 return f"خطأ عام أثناء معالجة ملف TXT (ID: {gdrive_file_id_sync}): {type(e_sync).__name__}"
 
         processed_text = await asyncio.to_thread(process_txt_file_sync, service, file_id, mode)
-        
+
         # Edit the "جاري المعالجة" message with the result or send a new one if it's too long / causes issues
         try:
              await context.bot.edit_message_text(chat_id=status_message.chat_id, message_id=status_message.message_id, text=processed_text, parse_mode='MarkdownV2')
@@ -1363,7 +1386,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         next_token_from_cb = parts[3] if len(parts) > 3 else None
         if next_token_from_cb == 'None': # Handle explicit 'None' string if passed
             next_token_from_cb = None
-            
+
         logger.info(f"User {user_id} requested GDrive page. Folder ID: {folder_id_from_cb}, Next Page Token: {next_token_from_cb}")
         # Call list_gdrive_files_command, making sure `update` is the CallbackQuery object
         await list_gdrive_files_command(update.callback_query, context, page_token=next_token_from_cb, folder_id=folder_id_from_cb)
@@ -1425,7 +1448,7 @@ if __name__ == '__main__':
     # This should be after specific document handlers like PDF, but before generic message handlers.
     doc_upload_handler = MessageHandler(filters.Document.ALL, handle_document_upload)
     application.add_handler(doc_upload_handler)
-    
+
     # --- Handlers for main keyboard button presses ---
     # These should be placed before the generic echo_message handler.
     application.add_handler(MessageHandler(filters.Regex(r"^🗂️ ملفاتي في Drive$"), list_gdrive_files_command))
@@ -1461,7 +1484,7 @@ if __name__ == '__main__':
 async def handle_search_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     search_params = context.user_data
-    
+
     file_id = search_params.get('search_file_id')
     mime_type = search_params.get('search_mime_type')
     column_name = search_params.get('search_selected_column_name')
@@ -1490,54 +1513,51 @@ async def handle_search_results(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
     if isinstance(results_df_or_error_str, pd.DataFrame):
-        logger.info(f"User {user_id}: Search successful. Found {len(results_df_or_error_str)} results in '{file_name}'.")
-        # For now, just confirm count. Detailed display in next step.
-        # We'll store the dataframe in user_data to be picked up by the next step/handler for display.
-        context.user_data['search_results_df'] = results_df_or_error_str 
-        
-        # This message will be replaced by the actual results display logic later
-        await update.message.reply_text(
-            f"تم العثور على {len(results_df_or_error_str)} نتيجة. (عرض النتائج التفصيلي قيد التطوير)."
-        )
-        # If we want to proceed to a new state for displaying results within the conversation:
-        # return DISPLAY_SEARCH_RESULTS 
-        # For now, the conversation ends after this.
-        if results_df_or_error_str.empty:
+        results_df = results_df_or_error_str
+        logger.info(f"User {user_id}: Search successful. Found {len(results_df)} results in '{file_name}'.")
+        # The line below was commented out in the previous correct diff, so keeping it commented.
+        # context.user_data['search_results_df'] = results_df
+
+        if results_df.empty:
             await update.message.reply_text("لم يتم العثور على نتائج تطابق معايير البحث المحددة.")
         else:
-            num_total_results = len(results_df_or_error_str)
-            max_preview_rows = 10  # Max rows to show in preview
-            preview_df = results_df_or_error_str.head(max_preview_rows)
-            
+            num_total_results = len(results_df)
+            max_preview_rows = 10
+            preview_df = results_df.head(max_preview_rows)
+
             try:
-                # Convert DataFrame preview to string
                 preview_text = preview_df.to_string(index=False, na_rep='-')
             except Exception as e_to_str:
                 logger.error(f"Error converting DataFrame to string for preview: {e_to_str}")
                 preview_text = "خطأ في تنسيق معاينة النتائج."
 
-            max_chars = 4000 # Approx Telegram message limit
-            if len(preview_text) > max_chars:
-                preview_text = preview_text[:max_chars] + "\n... (تم اقتطاع المعاينة لطولها الزائد)"
-            
-            message = f"تم العثور على {num_total_results} نتيجة."
-            if num_total_results > 0: # Should always be true if not empty, but good check
-                message += f"\nإليك معاينة لأول {min(num_total_results, max_preview_rows)} نتيجة:\n\n```\n{preview_text}\n```" # escape_markdown_v2 not needed for text inside code block
-            
+            max_chars_telegram = 4096
+            message_header = f"تم العثور على {num_total_results} نتيجة."
+            if num_total_results > 0:
+                message_header += f"\nإليك معاينة لأول {min(num_total_results, max_preview_rows)} نتيجة:\n\n"
+
+            code_block_ticks = "\n```\n"
+
+            # Adjusted safety margin for more reliable truncation
+            available_chars_for_text = max_chars_telegram - (len(message_header) + len(code_block_ticks) * 2 + 100)
+
+            if len(preview_text) > available_chars_for_text:
+                # Ensure we don't cut in the middle of a multi-byte character if string is unicode
+                # However, Python string slicing is based on character counts, not bytes.
+                # The main concern is the overall message length for Telegram.
+                preview_text = preview_text[:available_chars_for_text] + "\n... (تم اقتطاع المعاينة لطولها الزائد)"
+
+            message = f"{message_header}```\n{preview_text}\n```"
+
             if num_total_results > max_preview_rows:
                 message += f"\n\n(يتم عرض أول {max_preview_rows} نتيجة فقط من إجمالي {num_total_results})."
-                # TODO: Implement "Download full results as CSV" button here
-                # results_id = str(uuid.uuid4()) # Requires import uuid
-                # context.bot_data[f"search_results_{results_id}"] = results_df_or_error_str # Store full df
-                # dl_button = InlineKeyboardButton("تنزيل النتائج كاملة (CSV)", callback_data=f"download_search_csv_{results_id}")
-                # reply_markup = InlineKeyboardMarkup([[dl_button]])
-                # await update.message.reply_text(message, parse_mode='MarkdownV2', reply_markup=reply_markup)
-                await update.message.reply_text(message, parse_mode='MarkdownV2') # Send without button for now
+                # TODO: Implement "Download full results as CSV" button here later
+                await update.message.reply_text(message, parse_mode='MarkdownV2')
             else:
                 await update.message.reply_text(message, parse_mode='MarkdownV2')
-            
-    else: # It's an error string
-        error_str = results_df_or_error_str # Rename for clarity
+
+    else:
+        error_str = results_df_or_error_str
         logger.error(f"User {user_id}: Search failed for file '{file_name}': {error_str}")
         await update.message.reply_text(f"خطأ في البحث: {escape_markdown_v2(error_str)}")
 
@@ -1558,7 +1578,7 @@ async def received_filename_for_search(update: Update, context: ContextTypes.DEF
         return SELECT_FILE
 
     await update.message.reply_text(f"جاري البحث عن ملف باسم: '{escape_markdown_v2(filename_query)}'...")
-    
+
     service = await get_gdrive_service_async()
     if not service:
         await update.message.reply_text("تعذر الاتصال بخدمة Google Drive. لا يمكن متابعة البحث. حاول مرة أخرى لاحقًا أو استخدم /cancel_search.")
@@ -1572,11 +1592,11 @@ async def received_filename_for_search(update: Update, context: ContextTypes.DEF
         context.user_data['search_file_id'] = found_file_id
         context.user_data['search_file_name'] = found_file_name
         context.user_data['search_mime_type'] = found_mime_type
-        
+
         await update.message.reply_text(f"تم العثور على ملف: '{escape_markdown_v2(found_file_name)}' (نوع: {found_mime_type}).\nجاري استخلاص الأعمدة...")
-        
+
         columns = await get_schema_from_file_async(service, found_file_id, found_mime_type)
-        
+
         if columns: # Check if columns is not None and not empty
             context.user_data['search_file_columns'] = columns
             keyboard = [[InlineKeyboardButton(col, callback_data=f"search_col_select_{idx}")] for idx, col in enumerate(columns)]
@@ -1612,9 +1632,9 @@ async def received_column_for_search(update: Update, context: ContextTypes.DEFAU
     selected_column_name = context.user_data['search_file_columns'][selected_col_index]
     context.user_data['search_selected_column_name'] = selected_column_name
     context.user_data['search_selected_column_index'] = selected_col_index
-    
+
     logger.info(f"User selected column '{selected_column_name}' (index {selected_col_index}) for file '{context.user_data.get('search_file_name')}'.")
-    
+
     await query.edit_message_text(text=f"تم اختيار عمود: '{escape_markdown_v2(selected_column_name)}'.\nالآن، كيف تريد البحث؟ (سيتم عرض خيارات المطابقة)")
     # For now, ending the conversation here. Next step will define SELECT_MATCH_TYPE state.
     # return ConversationHandler.END # Original placeholder end
@@ -1639,9 +1659,9 @@ async def received_column_for_search(update: Update, context: ContextTypes.DEFAU
             row_buttons = []
     if row_buttons: # Add any remaining button
         keyboard.append(row_buttons)
-    
+
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
+
     await query.edit_message_text(
         text=f"تم اختيار عمود: '{escape_markdown_v2(selected_column_name)}'.\nالرجاء اختيار نوع المطابقة للقيمة التي ستبحث عنها:",
         reply_markup=reply_markup,
@@ -1656,12 +1676,12 @@ async def received_match_type(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Storing the selected match type
     match_type_key = query.data.split('_')[-1]
     context.user_data['search_match_type'] = match_type_key
-    
+
     # For user-friendliness, get the display text of the match type
     # This requires match_types to be accessible here or passed/redefined.
     # For now, just use the key.
     logger.info(f"User selected match type: {match_type_key}")
-    
+
     await query.edit_message_text(text=f"تم اختيار نوع المطابقة: {match_type_key}.\nالرجاء إدخال القيمة التي تريد البحث عنها في عمود '{escape_markdown_v2(context.user_data.get('search_selected_column_name', 'المحدد'))}'.")
     return INPUT_SEARCH_VALUE # Transition to inputting search value
 
@@ -1695,7 +1715,7 @@ async def received_search_value(update: Update, context: ContextTypes.DEFAULT_TY
     # TODO: In the next plan step, call a function here like:
     # await perform_actual_search(update, context) # This is now handle_search_results
     # For now, we just end the conversation after calling handle_search_results.
-    
+
     await handle_search_results(update, context) # Call the new handler
 
     context.user_data.clear()
