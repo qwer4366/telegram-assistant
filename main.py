@@ -12,6 +12,7 @@ load_dotenv()
 
 import json # For JSON processing
 import csv # For CSV schema extraction
+import uuid # For generating unique IDs for search results
 import re # For parsing --file in /askdata
 from rapidfuzz import fuzz, process as rapidfuzz_process # For fuzzy file name matching
 
@@ -290,23 +291,23 @@ def find_file_in_gdrive_sync(gdrive_service, filename_query: str) -> tuple[str |
             # Retrieve the original item to get its mimeType
             original_item = next((item for item in items if item['id'] == file_id_str), None)
             if original_item:
-                return original_item.get('id'), original_item.get('name'), original_item.get('mimeType')
+                return original_item.get('id'), original_item.get('name'), original_item.get('mimeType'), score # Add score
             else:
                 # This should ideally not happen if file_id_str came from our choices keys
                 logger.error(f"Consistency error: Could not find original item for ID {file_id_str} after fuzzy matching.")
-                return None, None, None
+                return None, None, None, None # Add None for score
         else:
             logger.info(f"No suitable fuzzy match found for '{filename_query}' with cutoff 70%.")
-            return None, None, None
+            return None, None, None, None # Add None for score
 
     except HttpError as error:
         logger.error(f"HttpError during GDrive file list for fuzzy matching '{filename_query}': {error}")
-        return None, None, None
+        return None, None, None, None # Add None for score
     except Exception as e:
         logger.error(f"General error during GDrive file list for fuzzy matching '{filename_query}': {e}", exc_info=True)
-        return None, None, None
+        return None, None, None, None # Add None for score
 
-async def find_file_in_gdrive_async(gdrive_service, filename_query: str) -> tuple[str | None, str | None, str | None]:
+async def find_file_in_gdrive_async(gdrive_service, filename_query: str) -> tuple[str | None, str | None, str | None, float | None]: # Updated return type hint
     return await asyncio.to_thread(find_file_in_gdrive_sync, gdrive_service, filename_query)
 
 def get_schema_from_file_sync(gdrive_service, file_id: str, mime_type: str) -> list[str] | None: # Return type updated
@@ -1515,8 +1516,6 @@ async def handle_search_results(update: Update, context: ContextTypes.DEFAULT_TY
     if isinstance(results_df_or_error_str, pd.DataFrame):
         results_df = results_df_or_error_str
         logger.info(f"User {user_id}: Search successful. Found {len(results_df)} results in '{file_name}'.")
-        # The line below was commented out in the previous correct diff, so keeping it commented.
-        # context.user_data['search_results_df'] = results_df
 
         if results_df.empty:
             await update.message.reply_text("لم يتم العثور على نتائج تطابق معايير البحث المحددة.")
@@ -1537,24 +1536,37 @@ async def handle_search_results(update: Update, context: ContextTypes.DEFAULT_TY
                 message_header += f"\nإليك معاينة لأول {min(num_total_results, max_preview_rows)} نتيجة:\n\n"
 
             code_block_ticks = "\n```\n"
-
-            # Adjusted safety margin for more reliable truncation
             available_chars_for_text = max_chars_telegram - (len(message_header) + len(code_block_ticks) * 2 + 100)
 
             if len(preview_text) > available_chars_for_text:
-                # Ensure we don't cut in the middle of a multi-byte character if string is unicode
-                # However, Python string slicing is based on character counts, not bytes.
-                # The main concern is the overall message length for Telegram.
                 preview_text = preview_text[:available_chars_for_text] + "\n... (تم اقتطاع المعاينة لطولها الزائد)"
 
             message = f"{message_header}```\n{preview_text}\n```"
 
+            keyboard_buttons = []
+            results_id = None # Initialize results_id to None
+
+            if num_total_results > 0: # Only offer download if there are results
+                try:
+                    # Ensure results_df is not just an error string before attempting to_csv
+                    if isinstance(results_df, pd.DataFrame):
+                        csv_data_string = results_df.to_csv(index=False, encoding='utf-8')
+                        results_id = str(uuid.uuid4())
+                        context.bot_data[f"search_results_{results_id}"] = csv_data_string
+                        logger.info(f"Stored search results with ID {results_id} in bot_data for potential download by user {user_id}.")
+                        download_button = InlineKeyboardButton("تنزيل النتائج كاملة (CSV)", callback_data=f"download_search_results_{results_id}")
+                        keyboard_buttons.append([download_button])
+                    else:
+                        logger.warning(f"Skipping CSV conversion as results_df is not a DataFrame for user {user_id}, file '{file_name}'.")
+                except Exception as e_csv:
+                    logger.error(f"Error converting full results to CSV for user {user_id}, file '{file_name}': {e_csv}")
+                    # results_id remains None, so no download button will be shown
+
             if num_total_results > max_preview_rows:
                 message += f"\n\n(يتم عرض أول {max_preview_rows} نتيجة فقط من إجمالي {num_total_results})."
-                # TODO: Implement "Download full results as CSV" button here later
-                await update.message.reply_text(message, parse_mode='MarkdownV2')
-            else:
-                await update.message.reply_text(message, parse_mode='MarkdownV2')
+
+            reply_markup = InlineKeyboardMarkup(keyboard_buttons) if keyboard_buttons else None
+            await update.message.reply_text(message, parse_mode='MarkdownV2', reply_markup=reply_markup)
 
     else:
         error_str = results_df_or_error_str
@@ -1584,7 +1596,7 @@ async def received_filename_for_search(update: Update, context: ContextTypes.DEF
         await update.message.reply_text("تعذر الاتصال بخدمة Google Drive. لا يمكن متابعة البحث. حاول مرة أخرى لاحقًا أو استخدم /cancel_search.")
         return ConversationHandler.END # Or SELECT_FILE to allow retry without full cancel
 
-    found_file_id, found_file_name, found_mime_type = await find_file_in_gdrive_async(service, filename_query)
+    found_file_id, found_file_name, found_mime_type, match_score = await find_file_in_gdrive_async(service, filename_query)
 
     compatible_mime_types = ['text/csv', 'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet']
 
@@ -1592,8 +1604,19 @@ async def received_filename_for_search(update: Update, context: ContextTypes.DEF
         context.user_data['search_file_id'] = found_file_id
         context.user_data['search_file_name'] = found_file_name
         context.user_data['search_mime_type'] = found_mime_type
+        context.user_data['search_file_match_score'] = match_score # Store match score
+        context.user_data['search_filename_query'] = filename_query # Store original query
 
-        await update.message.reply_text(f"تم العثور على ملف: '{escape_markdown_v2(found_file_name)}' (نوع: {found_mime_type}).\nجاري استخلاص الأعمدة...")
+        confirmation_msg = f"باستخدام البحث التقريبي، تم العثور على ملف: '{escape_markdown_v2(found_file_name)}'"
+        if match_score is not None: # Should always be there if file is found by fuzzy search
+            confirmation_msg += f" (بدرجة تشابه {match_score:.0f}%)."
+        else: # Fallback if score wasn't returned, though find_file_in_gdrive_sync should always return it now
+            confirmation_msg += "."
+        confirmation_msg += "\nسيتم الآن محاولة استخلاص الأعمدة منه."
+        await update.message.reply_text(confirmation_msg, parse_mode='MarkdownV2')
+
+        # Update the message before schema extraction, which can take time
+        # await update.message.reply_text(f"تم العثور على ملف: '{escape_markdown_v2(found_file_name)}' (نوع: {found_mime_type}, تشابه: {match_score:.0f}%).\nجاري استخلاص الأعمدة...")
 
         columns = await get_schema_from_file_async(service, found_file_id, found_mime_type)
 
