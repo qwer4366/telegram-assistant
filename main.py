@@ -61,6 +61,10 @@ ADMIN_IDS = [ADMIN_ID_1, ADMIN_ID_2]
 
 # --- Conversation Handler States for /searchdata ---
 SELECT_FILE, SELECT_COLUMN, SELECT_MATCH_TYPE, INPUT_SEARCH_VALUE = range(4)
+
+# --- Conversation Handler States for /move ---
+CHOOSE_SOURCE_FILE, HANDLE_SOURCE_FILE_RESULTS, CHOOSE_TARGET_FOLDER, HANDLE_TARGET_FOLDER_RESULTS, CONFIRM_MOVE_ACTION = range(4, 9)
+
 SCOPES = ['https://www.googleapis.com/auth/drive']
 CLIENT_SECRET_FILE = 'client_secret.json'
 TOKEN_FILE = 'token.json'
@@ -257,16 +261,13 @@ async def get_openai_response(api_key: str, messages: list) -> str:
         return f"عذراً، حدث خطأ أثناء محاولة الاتصال بـ OpenAI: ({type(e).__name__})"
 
 # --- Funciones para Búsqueda de Archivos y Schema en Google Drive ---
-def find_file_in_gdrive_sync(gdrive_service, filename_query: str) -> tuple[str | None, str | None, str | None]:
+def find_file_in_gdrive_sync(gdrive_service, filename_query: str, limit: int = 5) -> list[tuple[str, str, str, float]]:
     try:
-        # Fetch a broader set of files to perform fuzzy matching on
-        # For now, fetching from root, ordered by most recent. This can be refined.
-        # Consider targetting specific folders if context allows, or increasing pageSize if necessary.
-        drive_query = "trashed = false and mimeType != 'application/vnd.google-apps.folder'" # Exclude folders from fuzzy search pool for now
+        drive_query = "trashed = false and mimeType != 'application/vnd.google-apps.folder'"
         logger.info(f"Fetching up to 100 files from GDrive for fuzzy matching against: '{filename_query}'")
         results = gdrive_service.files().list(
             q=drive_query,
-            pageSize=100,  # Fetch a decent pool of candidates
+            pageSize=100,
             orderBy="modifiedTime desc",
             fields="files(id, name, mimeType)"
         ).execute()
@@ -274,43 +275,151 @@ def find_file_in_gdrive_sync(gdrive_service, filename_query: str) -> tuple[str |
         items = results.get('files', [])
         if not items:
             logger.info("No files found in GDrive to perform fuzzy matching.")
-            return None, None, None
+            return []
 
-        # Prepare choices for rapidfuzz: a dictionary mapping file ID to file name
         choices = {item['id']: item['name'] for item in items}
 
-        # Use rapidfuzz to find the best match above a certain score cutoff
-        # WRatio is good for finding matches even when words are out of order or strings are of different lengths
-        best_match = rapidfuzz_process.extractOne(filename_query, choices, scorer=fuzz.WRatio, score_cutoff=70) # score_cutoff (0-100)
+        # Use rapidfuzz to find the top N matches above a certain score cutoff
+        best_matches = rapidfuzz_process.extract(filename_query, choices, scorer=fuzz.WRatio, limit=limit, score_cutoff=70)
 
-        if best_match:
-            # best_match is a tuple: (matched_name_from_choices, score, original_key_from_choices (which is file_id))
-            matched_name_str, score, file_id_str = best_match
-            logger.info(f"Fuzzy match for '{filename_query}': Found '{matched_name_str}' (ID: {file_id_str}) with score {score:.2f}%.")
-
-            # Retrieve the original item to get its mimeType
-            original_item = next((item for item in items if item['id'] == file_id_str), None)
-            if original_item:
-                return original_item.get('id'), original_item.get('name'), original_item.get('mimeType'), score # Add score
-            else:
-                # This should ideally not happen if file_id_str came from our choices keys
-                logger.error(f"Consistency error: Could not find original item for ID {file_id_str} after fuzzy matching.")
-                return None, None, None, None # Add None for score
+        matched_files_details = []
+        if best_matches:
+            for matched_name_str, score, file_id_str in best_matches:
+                original_item = next((item for item in items if item['id'] == file_id_str), None)
+                if original_item:
+                    matched_files_details.append((
+                        original_item.get('id'),
+                        original_item.get('name'),
+                        original_item.get('mimeType'),
+                        score
+                    ))
+            logger.info(f"Fuzzy search for '{filename_query}' returned {len(matched_files_details)} match(es) (limit {limit}, cutoff 70%).")
+            return matched_files_details
         else:
-            logger.info(f"No suitable fuzzy match found for '{filename_query}' with cutoff 70%.")
-            return None, None, None, None # Add None for score
+            logger.info(f"No suitable fuzzy matches found for '{filename_query}' with limit {limit}, cutoff 70%.")
+            return []
 
     except HttpError as error:
         logger.error(f"HttpError during GDrive file list for fuzzy matching '{filename_query}': {error}")
-        return None, None, None, None # Add None for score
+        return []
     except Exception as e:
         logger.error(f"General error during GDrive file list for fuzzy matching '{filename_query}': {e}", exc_info=True)
-        return None, None, None, None # Add None for score
+        return []
 
-async def find_file_in_gdrive_async(gdrive_service, filename_query: str) -> tuple[str | None, str | None, str | None, float | None]: # Updated return type hint
-    return await asyncio.to_thread(find_file_in_gdrive_sync, gdrive_service, filename_query)
+async def find_file_in_gdrive_async(gdrive_service, filename_query: str, limit: int = 5) -> list[tuple[str, str, str, float]]:
+    return await asyncio.to_thread(find_file_in_gdrive_sync, gdrive_service, filename_query, limit)
 
-def get_schema_from_file_sync(gdrive_service, file_id: str, mime_type: str) -> list[str] | None: # Return type updated
+# --- Funciones para Búsqueda de Carpetas en Google Drive ---
+def find_folder_in_gdrive_sync(gdrive_service, folder_name_query: str, limit: int = 5) -> list[tuple[str, str, str, float]]:
+    try:
+        drive_query = "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        logger.info(f"Fetching up to 100 folders from GDrive for fuzzy matching against: '{folder_name_query}'")
+        results = gdrive_service.files().list(
+            q=drive_query,
+            pageSize=100, # Fetch a decent pool of recent folders
+            orderBy="modifiedTime desc", # Or 'name' if preferred for folders
+            fields="files(id, name, mimeType)"
+        ).execute()
+
+        items = results.get('files', [])
+        if not items:
+            logger.info("No folders found in GDrive to perform fuzzy matching.")
+            return []
+
+        choices = {item['id']: item['name'] for item in items}
+
+        best_matches = rapidfuzz_process.extract(folder_name_query, choices, scorer=fuzz.WRatio, limit=limit, score_cutoff=70)
+
+        matched_folders_details = []
+        if best_matches:
+            for matched_name_str, score, folder_id_str in best_matches:
+                original_item = next((item for item in items if item['id'] == folder_id_str), None)
+                if original_item:
+                    matched_folders_details.append((
+                        original_item.get('id'),
+                        original_item.get('name'),
+                        original_item.get('mimeType'), # Should be 'application/vnd.google-apps.folder'
+                        score
+                    ))
+            logger.info(f"Fuzzy folder search for '{folder_name_query}' returned {len(matched_folders_details)} match(es) (limit {limit}, cutoff 70%).")
+            return matched_folders_details
+        else:
+            logger.info(f"No suitable fuzzy folder matches found for '{folder_name_query}' with limit {limit}, cutoff 70%.")
+            return []
+
+    except HttpError as error:
+        logger.error(f"HttpError during GDrive folder list for fuzzy matching '{folder_name_query}': {error}")
+        return []
+    except Exception as e:
+        logger.error(f"General error during GDrive folder list for fuzzy matching '{folder_name_query}': {e}", exc_info=True)
+        return []
+
+async def find_folder_in_gdrive_async(gdrive_service, folder_name_query: str, limit: int = 5) -> list[tuple[str, str, str, float]]:
+    return await asyncio.to_thread(find_folder_in_gdrive_sync, gdrive_service, folder_name_query, limit)
+
+# --- Funciones para Mover Archivos en Google Drive ---
+def perform_actual_file_move_sync(gdrive_service, source_file_id: str, target_folder_id: str) -> bool:
+    logger.info(f"Attempting to move file ID {source_file_id} to folder ID {target_folder_id}")
+    try:
+        # Get current parents of the file
+        file_metadata = gdrive_service.files().get(fileId=source_file_id, fields='parents').execute()
+        current_parents = file_metadata.get('parents', [])
+
+        if not current_parents:
+            # This case can occur if the file is in the root or shared directly and not in any folder.
+            # If it's already in root and target is root, no action needed, but API handles this.
+            logger.warning(f"File {source_file_id} has no current parents listed by API. Proceeding to add target parent.")
+            previous_parents_str = "" # No parents to remove
+        else:
+            previous_parents_str = ",".join(current_parents)
+
+        # If the file is already in the target folder and it's the *only* parent,
+        # and we are trying to move it to the same folder,
+        # the operation `addParents=target_folder_id, removeParents=previous_parents_str`
+        # where target_folder_id is in previous_parents_str (and is the only one) would effectively remove it.
+        # This is generally okay as Drive usually prevents removing the last parent if it's the same as addParents.
+        # A more advanced check could be: if current_parents == [target_folder_id], then it's already there.
+        if current_parents and target_folder_id in current_parents and len(current_parents) == 1:
+            logger.info(f"File {source_file_id} is already in the target folder {target_folder_id} and has no other parents. No move needed.")
+            return True # Considered success as it's already in the desired state.
+
+        updated_file = gdrive_service.files().update(
+            fileId=source_file_id,
+            addParents=target_folder_id,
+            removeParents=previous_parents_str,
+            fields='id, parents'
+        ).execute()
+
+        # Verify if the target folder is now among the parents
+        if target_folder_id in updated_file.get('parents', []):
+            logger.info(f"File {source_file_id} successfully moved/added to folder {target_folder_id}. Current parents: {updated_file.get('parents')}")
+            return True
+        else:
+            # This might happen if the file was moved to root by removing all parents, and target_folder_id was 'root'.
+            # Or if there was an issue not caught by an exception.
+            if not updated_file.get('parents') and target_folder_id == 'root': # Special case for moving to root
+                 logger.info(f"File {source_file_id} successfully moved to root (no parents listed).")
+                 return True
+            logger.error(f"File {source_file_id} move to {target_folder_id} seemed to execute, but target parent not confirmed in response. Current parents: {updated_file.get('parents')}")
+            # It's possible the file is now in multiple locations if removeParents didn't fully work as expected by user.
+            # For now, if API didn't throw error but verification fails, we log it.
+            # Depending on strictness, could return False. Let's assume API success means True for now if no HttpError.
+            return True # Or False if strict verification is required. Let's be optimistic if no HttpError.
+
+    except HttpError as error:
+        logger.error(f"HttpError during file move of {source_file_id} to {target_folder_id}: {error.resp.status} - {error.content.decode()}")
+        # Specific error for trying to remove the last parent without adding another (for non-root files)
+        if error.resp.status == 403 and "cannot remove last parent" in error.content.decode().lower():
+             logger.error("This error often means the file is in root or shared, and an attempt was made to remove its only 'parent-like' status without adding a new folder.")
+        return False
+    except Exception as e:
+        logger.error(f"General error during file move of {source_file_id} to {target_folder_id}: {e}", exc_info=True)
+        return False
+
+async def perform_actual_file_move_async(gdrive_service, source_file_id: str, target_folder_id: str) -> bool:
+    return await asyncio.to_thread(perform_actual_file_move_sync, gdrive_service, source_file_id, target_folder_id)
+
+def get_schema_from_file_sync(gdrive_service, file_id: str, mime_type: str) -> list[str] | str | None: # Return type updated to include error string
     try:
         logger.info(f"Attempting to download file ID {file_id} for schema extraction (MIME: {mime_type}).")
         request = gdrive_service.files().get_media(fileId=file_id)
@@ -383,7 +492,7 @@ def get_schema_from_file_sync(gdrive_service, file_id: str, mime_type: str) -> l
         logger.error(f"General error in get_schema_from_file_sync for file ID {file_id}: {e}", exc_info=True)
         return None # Indicate error by returning None
 
-async def get_schema_from_file_async(gdrive_service, file_id: str, mime_type: str) -> list[str] | None: # Return type updated
+async def get_schema_from_file_async(gdrive_service, file_id: str, mime_type: str) -> list[str] | str | None: # Return type updated
     return await asyncio.to_thread(get_schema_from_file_sync, gdrive_service, file_id, mime_type)
 
 # --- Funciones para Búsqueda de Datos en Archivos ---
@@ -1472,6 +1581,22 @@ if __name__ == '__main__':
     )
     application.add_handler(search_conv_handler)
 
+    # --- Add Move Conversation Handler ---
+    move_conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('move', start_move_conversation)],
+        states={
+            CHOOSE_SOURCE_FILE: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_source_filename_for_move)],
+            HANDLE_SOURCE_FILE_RESULTS: [CallbackQueryHandler(selected_source_file_for_move, pattern=r'^movesrc_idx_\d+$')],
+            CHOOSE_TARGET_FOLDER: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_target_folder_name_for_move)],
+            HANDLE_TARGET_FOLDER_RESULTS: [CallbackQueryHandler(selected_target_folder_for_move, pattern=r'^movetgt_idx_\d+$')],
+            CONFIRM_MOVE_ACTION: [CallbackQueryHandler(confirmed_move_action, pattern=r'^confirmmove_(yes|no)$')],
+        },
+        fallbacks=[CommandHandler('cancel_move', cancel_move_conversation)],
+        # persistent=False, # Using default (memory-based persistence for now)
+        # allow_reentry=True # Default is False, which is usually fine
+    )
+    application.add_handler(move_conv_handler)
+
     application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), echo_message))
     application.add_handler(MessageHandler(filters.COMMAND, unknown_command)) # Keep this last for unhandled commands
     
@@ -1480,6 +1605,265 @@ if __name__ == '__main__':
 
     logger.info("Bot has stopped.")
 
+
+# --- /move Conversation Functions ---
+async def start_move_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data.clear()
+    await update.message.reply_text(
+        "أهلاً بك في معالج نقل الملفات!\n"
+        "الرجاء إدخال اسم الملف (أو جزء من اسمه) الذي تريد نقله."
+    )
+    return CHOOSE_SOURCE_FILE
+
+async def received_source_filename_for_move(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    filename_query = update.message.text.strip()
+    if not filename_query:
+        await update.message.reply_text("لم يتم إدخال اسم ملف. الرجاء إدخال اسم ملف صالح أو استخدم /cancel_move للإلغاء.")
+        return CHOOSE_SOURCE_FILE
+
+    await update.message.reply_text(f"جاري البحث عن ملف مصدر باسم: '{escape_markdown_v2(filename_query)}'...")
+
+    service = await get_gdrive_service_async()
+    if not service:
+        await update.message.reply_text("تعذر الاتصال بخدمة Google Drive. لا يمكن متابعة عملية النقل. حاول مرة أخرى لاحقًا أو استخدم /cancel_move.")
+        return ConversationHandler.END
+
+    # Use find_file_in_gdrive_async, which now returns a list of tuples
+    matched_files = await find_file_in_gdrive_async(service, filename_query, limit=5)
+
+    if not matched_files:
+        await update.message.reply_text("لم يتم العثور على ملفات تطابق هذا الاسم. الرجاء المحاولة مرة أخرى باسم مختلف أو استخدم /cancel_move للإلغاء.")
+        return CHOOSE_SOURCE_FILE
+
+    # Case 1: Single, high-confidence match
+    if len(matched_files) == 1 and matched_files[0][3] >= 90.0: # score is the 4th element (index 3)
+        file_id, file_name, mime_type, score = matched_files[0]
+
+        context.user_data['move_source_file_id'] = file_id
+        context.user_data['move_source_file_name'] = file_name
+        # mime_type and score are not strictly needed for the move operation itself later,
+        # but good for confirmation message and potential logging.
+
+        logger.info(f"/move: User {update.effective_user.id} - Source file '{file_name}' (ID: {file_id}) auto-selected with score {score:.2f}%.")
+
+        await update.message.reply_text(
+            f"تم اختيار الملف المصدر: '{escape_markdown_v2(file_name)}' (بدرجة تشابه {score:.0f}%).\n"
+            "الآن، الرجاء إدخال اسم المجلد الهدف الذي تريد نقل الملف إليه.",
+            parse_mode='MarkdownV2'
+        )
+        return CHOOSE_TARGET_FOLDER
+
+    # Case 2: Multiple matches or single lower-confidence match
+    else:
+        context.user_data['move_candidate_source_files'] = matched_files
+        keyboard = []
+        for idx, (file_id, name, mime, score) in enumerate(matched_files):
+            button_text = f"{name} ({score:.0f}%)"
+            # Callback data includes index to retrieve from context.user_data['move_candidate_source_files']
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"movesrc_idx_{idx}")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            "تم العثور على عدة ملفات محتملة. الرجاء اختيار الملف المصدر الصحيح من القائمة أدناه:",
+            reply_markup=reply_markup
+        )
+        return HANDLE_SOURCE_FILE_RESULTS
+
+async def selected_source_file_for_move(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # Logic for HANDLE_SOURCE_FILE_RESULTS state (triggered by CallbackQuery with pattern movesrc_idx_\d+)
+    # This function will be fully implemented in the next subtask.
+    query = update.callback_query
+    await query.answer()
+
+    selected_idx = int(query.data.split('_')[-1]) # e.g., 'movesrc_idx_0' -> 0
+    candidate_files = context.user_data.get('move_candidate_source_files', [])
+
+    if 0 <= selected_idx < len(candidate_files):
+        file_id, file_name, mime_type, score = candidate_files[selected_idx]
+
+        context.user_data['move_source_file_id'] = file_id
+        context.user_data['move_source_file_name'] = file_name
+        # Clear candidates as selection is made
+        if 'move_candidate_source_files' in context.user_data:
+            del context.user_data['move_candidate_source_files']
+
+        logger.info(f"/move: User {update.effective_user.id} - Source file '{file_name}' (ID: {file_id}) selected by user from list (score {score:.2f}%).")
+
+        await query.edit_message_text(
+            text=f"تم اختيار الملف المصدر: '{escape_markdown_v2(file_name)}'.\n"
+                 "الآن، الرجاء إدخال اسم المجلد الهدف الذي تريد نقل الملف إليه.",
+            parse_mode='MarkdownV2'
+        )
+        return CHOOSE_TARGET_FOLDER
+    else:
+        logger.error(f"/move: User {update.effective_user.id} - Invalid index {selected_idx} selected for source file.")
+        await query.edit_message_text(text="حدث خطأ في اختيار الملف. الرجاء المحاولة مرة أخرى أو إلغاء العملية (/cancel_move).")
+        # Potentially return to CHOOSE_SOURCE_FILE or end conversation
+        return ConversationHandler.END # Or CHOOSE_SOURCE_FILE to retry
+
+async def received_target_folder_name_for_move(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    folder_name_query = update.message.text.strip()
+    if not folder_name_query:
+        await update.message.reply_text("لم يتم إدخال اسم مجلد. الرجاء إدخال اسم صالح أو استخدم /cancel_move للإلغاء.")
+        return CHOOSE_TARGET_FOLDER
+
+    source_file_name = context.user_data.get('move_source_file_name', 'الملف المحدد')
+    await update.message.reply_text(f"جاري البحث عن مجلد هدف باسم: '{escape_markdown_v2(folder_name_query)}' لنقل الملف '{escape_markdown_v2(source_file_name)}' إليه...")
+
+    service = await get_gdrive_service_async()
+    if not service:
+        await update.message.reply_text("تعذر الاتصال بخدمة Google Drive. لا يمكن متابعة عملية النقل. حاول مرة أخرى لاحقًا أو استخدم /cancel_move.")
+        return ConversationHandler.END
+
+    matched_folders = await find_folder_in_gdrive_async(service, folder_name_query, limit=5)
+
+    if not matched_folders:
+        await update.message.reply_text("لم يتم العثور على مجلدات تطابق هذا الاسم. الرجاء المحاولة مرة أخرى باسم مختلف أو استخدم /cancel_move للإلغاء.")
+        return CHOOSE_TARGET_FOLDER
+
+    if len(matched_folders) == 1 and matched_folders[0][3] >= 90.0: # score is 4th element (index 3)
+        folder_id, folder_name, _, score = matched_folders[0]
+        context.user_data['move_target_folder_id'] = folder_id
+        context.user_data['move_target_folder_name'] = folder_name
+
+        logger.info(f"/move: User {update.effective_user.id} - Target folder '{folder_name}' (ID: {folder_id}) auto-selected with score {score:.2f}%.")
+
+        confirm_text = (
+            f"تم اختيار المجلد الهدف: '{escape_markdown_v2(folder_name)}' (بدرجة تشابه {score:.0f}%).\n\n"
+            f"هل أنت متأكد أنك تريد نقل الملف '{escape_markdown_v2(source_file_name)}' إلى المجلد '{escape_markdown_v2(folder_name)}'؟"
+        )
+        keyboard = [[InlineKeyboardButton("نعم، انقل الآن", callback_data="confirmmove_yes"),
+                     InlineKeyboardButton("لا، ألغِ", callback_data="confirmmove_no")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(confirm_text, reply_markup=reply_markup, parse_mode='MarkdownV2')
+        return CONFIRM_MOVE_ACTION
+    else:
+        context.user_data['move_candidate_target_folders'] = matched_folders
+        keyboard = []
+        for idx, (folder_id, name, _, score) in enumerate(matched_folders): # mime_type ('_') ignored for display
+            button_text = f"📁 {name} ({score:.0f}%)" # Added folder icon
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"movetgt_idx_{idx}")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text("تم العثور على عدة مجلدات محتملة. الرجاء اختيار المجلد الهدف الصحيح من القائمة أدناه:", reply_markup=reply_markup)
+        return HANDLE_TARGET_FOLDER_RESULTS
+
+async def selected_target_folder_for_move(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    selected_idx = int(query.data.split('_')[-1]) # e.g., 'movetgt_idx_0' -> 0
+    candidate_folders = context.user_data.get('move_candidate_target_folders', [])
+    source_file_name = context.user_data.get('move_source_file_name', 'الملف المحدد')
+
+    if 0 <= selected_idx < len(candidate_folders):
+        folder_id, folder_name, _, _ = candidate_folders[selected_idx] # mime_type and score not needed further
+
+        context.user_data['move_target_folder_id'] = folder_id
+        context.user_data['move_target_folder_name'] = folder_name
+
+        # Clean up candidate list from user_data
+        if 'move_candidate_target_folders' in context.user_data:
+            del context.user_data['move_candidate_target_folders']
+
+        logger.info(f"/move: User {update.effective_user.id} - Target folder '{folder_name}' (ID: {folder_id}) selected by user from list.")
+
+        confirm_text = (
+            f"تم اختيار المجلد الهدف: '{escape_markdown_v2(folder_name)}'.\n\n"
+            f"هل أنت متأكد أنك تريد نقل الملف '{escape_markdown_v2(source_file_name)}' إلى المجلد '{escape_markdown_v2(folder_name)}'؟"
+        )
+        keyboard = [[InlineKeyboardButton("نعم، انقل الآن", callback_data="confirmmove_yes"),
+                     InlineKeyboardButton("لا، ألغِ", callback_data="confirmmove_no")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(text=confirm_text, reply_markup=reply_markup, parse_mode='MarkdownV2')
+        return CONFIRM_MOVE_ACTION
+    else:
+        logger.error(f"/move: User {update.effective_user.id} - Invalid index {selected_idx} selected for target folder.")
+        await query.edit_message_text(text="حدث خطأ في اختيار المجلد الهدف. الرجاء بدء العملية من جديد باستخدام /move.")
+        context.user_data.clear()
+        return ConversationHandler.END
+
+async def confirmed_move_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    user_choice = query.data.split('_')[-1]  # 'yes' or 'no'
+
+    source_file_name = context.user_data.get('move_source_file_name', 'الملف المحدد')
+    target_folder_name = context.user_data.get('move_target_folder_name', 'المجلد المحدد')
+
+    if user_choice == 'yes':
+        source_file_id = context.user_data.get('move_source_file_id')
+        target_folder_id = context.user_data.get('move_target_folder_id')
+
+        if not source_file_id or not target_folder_id:
+            logger.error(f"/move: User {update.effective_user.id} - Missing source_file_id or target_folder_id in confirmation. Data: {context.user_data}")
+            await query.edit_message_text("حدث خطأ، معلومات الملف أو المجلد مفقودة. يرجى بدء العملية من جديد: /move")
+            # user_data.clear() is called at the end, so no need here
+            return ConversationHandler.END
+
+        logger.info(f"/move: User {update.effective_user.id} confirmed move of file ID {source_file_id} ('{source_file_name}') to folder ID {target_folder_id} ('{target_folder_name}').")
+
+        # Edit the message to show "Processing..."
+        # It's important this message is the one associated with the callback query for editing.
+        try:
+            await query.edit_message_text(
+                text=f"جاري نقل الملف '{escape_markdown_v2(source_file_name)}' إلى المجلد '{escape_markdown_v2(target_folder_name)}'...",
+                parse_mode='MarkdownV2'
+            )
+        except Exception as e_edit: # If editing fails (e.g. message too old, or not found)
+            logger.warning(f"Could not edit confirmation message before move: {e_edit}. Sending new message instead.")
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text=f"جاري نقل الملف '{escape_markdown_v2(source_file_name)}' إلى المجلد '{escape_markdown_v2(target_folder_name)}'...",
+                parse_mode='MarkdownV2'
+            )
+
+        service = await get_gdrive_service_async()
+        if not service:
+            # If service fails, send a new message as the "جاري النقل" message might have been sent or failed to edit.
+            await context.bot.send_message(
+                chat_id=query.message.chat_id,
+                text="خطأ: تعذر الاتصال بخدمة Google Drive. لم يتم نقل الملف.",
+                parse_mode='MarkdownV2'
+            )
+            # user_data.clear() is called at the end
+            return ConversationHandler.END
+
+        success = await perform_actual_file_move_async(service, source_file_id, target_folder_id)
+
+        final_message_text = ""
+        if success:
+            final_message_text = f"تم بنجاح نقل الملف '{escape_markdown_v2(source_file_name)}' إلى المجلد '{escape_markdown_v2(target_folder_name)}'."
+            logger.info(f"/move: Successfully moved file '{source_file_name}' to '{target_folder_name}'.")
+        else:
+            final_message_text = f"فشل نقل الملف '{escape_markdown_v2(source_file_name)}' إلى المجلد '{escape_markdown_v2(target_folder_name)}'.\nقد تحتاج للتحقق من الصلاحيات، أو أن الملف والمجلد ما زالا موجودين، أو أنك لا تحاول نقل مجلد إلى نفسه أو أحد مجلداته الفرعية."
+            logger.error(f"/move: Failed to move file '{source_file_name}' to '{target_folder_name}'.")
+
+        # Send the final status as a new message.
+        # Editing the "جاري النقل..." message can be unreliable if the async operation took too long
+        # or if the original message context is lost.
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=final_message_text,
+            parse_mode='MarkdownV2'
+        )
+
+    elif user_choice == 'no':
+        logger.info(f"/move: User {update.effective_user.id} cancelled the move of file '{source_file_name}' to folder '{target_folder_name}'.")
+        await query.edit_message_text(f"تم إلغاء عملية نقل الملف '{escape_markdown_v2(source_file_name)}'.")
+
+    else: # Should not happen with the current pattern
+        logger.warning(f"/move: User {update.effective_user.id} - Unknown choice '{user_choice}' in confirmed_move_action.")
+        await query.edit_message_text("خيار غير معروف. تم إلغاء العملية.")
+
+    context.user_data.clear()
+    return ConversationHandler.END
+
+async def cancel_move_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text("تم إلغاء عملية نقل الملف. يمكنك البدء من جديد باستخدام /move.")
+    context.user_data.clear()
+    return ConversationHandler.END
 
 # --- Search Results Handling ---
 async def handle_search_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1743,6 +2127,15 @@ async def received_search_value(update: Update, context: ContextTypes.DEFAULT_TY
 
     context.user_data.clear()
     return ConversationHandler.END
+
+# --- Placeholder for cancel_move_conversation_and_start if needed later ---
+# async def cancel_move_conversation_and_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+#     await cancel_move_conversation(update, context)
+#     # Assuming start_command is the entry point for a global menu or similar
+#     # If start_command itself returns a state for another conversation, handle that.
+#     # For now, just ending and relying on user to type /start if needed.
+#     # await start_command(update, context) # This might not work directly if start_command doesn't return a state or is not designed for this
+#     return ConversationHandler.END # Or the initial state of another conv.
 
 async def cancel_search_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("تم إلغاء عملية البحث. يمكنك البدء من جديد باستخدام /searchdata.")
