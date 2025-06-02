@@ -586,6 +586,19 @@ def perform_actual_search_sync(gdrive_service, file_id: str, mime_type: str, col
             filtered_df = df[col_as_str.str.startswith(search_value, case=False, na=False)]
         elif match_type == 'ends_with':
             filtered_df = df[col_as_str.str.endswith(search_value, case=False, na=False)]
+        elif match_type == 'fuzzy_contains':
+            str_search_value = str(search_value) # Ensure search_value is string
+            score_cutoff = 75  # Threshold for fuzzy match (0-100)
+
+            # Create a copy to safely add the new 'match_score' column
+            df_with_scores = df.copy()
+            df_with_scores['match_score'] = df_with_scores[column_name].astype(str).apply(
+                lambda x: fuzz.WRatio(str_search_value, str(x))
+            )
+
+            # Filter based on the new 'match_score' column
+            filtered_df = df_with_scores[df_with_scores['match_score'] >= score_cutoff]
+            # The 'match_score' column will be part of the returned filtered_df
         else:
             return f"نوع المطابقة '{match_type}' غير معروف."
 
@@ -1904,11 +1917,24 @@ async def handle_search_results(update: Update, context: ContextTypes.DEFAULT_TY
         if results_df.empty:
             await update.message.reply_text("لم يتم العثور على نتائج تطابق معايير البحث المحددة.")
         else:
+            # If 'match_score' is present (from fuzzy_contains), sort by it
+            if 'match_score' in results_df.columns:
+                results_df = results_df.sort_values(by='match_score', ascending=False)
+                # Optional: Format match_score for display, e.g., as percentage.
+                # For now, to_string will handle float formatting.
+                # If formatting to string (e.g., "75%"), do it on a copy for preview_df only,
+                # so that the CSV download retains numeric scores.
+                # Example for preview formatting (if desired later, apply to preview_df):
+                # preview_df_display = preview_df.copy()
+                # preview_df_display['match_score'] = preview_df_display['match_score'].map('{:.0f}%'.format)
+                # preview_text = preview_df_display.to_string(index=False, na_rep='-')
+
             num_total_results = len(results_df)
             max_preview_rows = 10
-            preview_df = results_df.head(max_preview_rows)
+            preview_df = results_df.head(max_preview_rows) # Now uses sorted df if applicable
 
             try:
+                # If match_score was formatted to string for display, use preview_df_display here
                 preview_text = preview_df.to_string(index=False, na_rep='-')
             except Exception as e_to_str:
                 logger.error(f"Error converting DataFrame to string for preview: {e_to_str}")
@@ -2048,13 +2074,14 @@ async def received_column_for_search(update: Update, context: ContextTypes.DEFAU
 
     match_types = {
         'contains': "يحتوي على (نص)",
-        'exact': "يساوي تمامًا (نص/رقم)", # Changed 'equals' to 'exact' for clarity
+        'exact': "يساوي تمامًا (نص/رقم)",
         'not_contains': "لا يحتوي على (نص)",
-        'not_exact': "لا يساوي تمامًا (نص/رقم)", # Changed 'not_equals'
+        'not_exact': "لا يساوي تمامًا (نص/رقم)",
         'greater_than': "أكبر من (رقم)",
         'less_than': "أصغر من (رقم)",
         'starts_with': "يبدأ بـ (نص)",
-        'ends_with': "ينتهي بـ (نص)"
+        'ends_with': "ينتهي بـ (نص)",
+        'fuzzy_contains': "يحتوي تقريبيًا (نص Fuzzy)" # New option
     }
     keyboard = []
     # Create two buttons per row for a cleaner look
